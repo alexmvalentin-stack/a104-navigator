@@ -2,7 +2,7 @@
 // A104 Navigator – web-app (PWA). Brugerfladen er skrevet her; al logik (søgning, dokumentfinder, BR18, AB 18 …)
 // er A104 Navigators egen Python-kerne, der kører i worker.js med Pyodide.
 
-const BUILD = '2.19.0-39e45e9e33';
+const BUILD = '2.19.0-6c5c358328';
 const VERSION = '2.19.0';
 
 // =========================================================================== hjælpere
@@ -1451,7 +1451,7 @@ async function snapshotFromQr(text) {
     items.push({ path, folder: false, size, modified: new Date(minutes * 60000).toISOString(), url: urlFor(path, true), by: by || '',
       approval: approval || '' });
   }
-  return { format: 'a104-projekt', project: { name: data.n, project_id: data.p, where: data.w, url: data.u }, created: data.c,
+  return { format: 'a104-projekt', project: { name: data.n, project_id: data.p, where: data.w, url: data.u, inbox: data.i || '' }, created: data.c,
     truncated: data.t, items };
 }
 
@@ -1609,7 +1609,8 @@ class ProjectPage {
   async saveSnapshot(data, fallbackName) {
     const pr = data.project || {};
     const name = pr.name || fallbackName;
-    const p = { id: `file:${name}`, source: 'file', name, where: pr.where || '', url: pr.url || '', projectId: pr.project_id || '' };
+    const p = { id: `file:${name}`, source: 'file', name, where: pr.where || '', url: pr.url || '', projectId: pr.project_id || '',
+      inbox: pr.inbox || '' };
     const items = data.items.map((i) => ({ id: i.path, name: i.path.split('/').pop(), path: i.path, folder: !!i.folder, size: i.size || 0,
       modified: i.modified || '', url: i.url || '', by: i.by || '', approval: i.approval || '' }));
     await store.set(`project-scan:${p.id}`, { at: data.created || new Date().toISOString(), truncated: !!data.truncated, items, file: true });
@@ -1900,9 +1901,10 @@ class ProjectPage {
     input.click();
   }
 
-  /** En ny fil fra telefonen: find mappe og A104-navn, og send den videre til OneDrive/Teams (Del). Appen må ikke
-   *  selv skrive i skolens OneDrive – det gør OneDrive-/Teams-appen. På pc'en står filen derefter som
-   *  »Mangler godkendelse«, til en på holdet godkender den. */
+  /** En ny fil fra telefonen: find mappe og A104-navn, og send den videre med OneDrive-appen (Del). Appen må ikke
+   *  selv skrive i skolens OneDrive. Projekter fra pc'en har en indbakke (OneDrive › A104 Navigator › Fra telefon ›
+   *  projekt): filen gemmes altid dér, og Windows-programmet lægger den selv på plads ud fra mappekoden i navnet.
+   *  På pc'en står filen derefter som »Mangler godkendelse«, til en på holdet godkender den. */
   showUpload(file) {
     const d = this.detail;
     const dot = file.name.lastIndexOf('.');
@@ -1920,6 +1922,9 @@ class ProjectPage {
     let auto = true;
     name.addEventListener('input', () => { auto = false; });
     const codeOf = () => this.status.folders[folderSel.value]?.code || '';
+    // mappekoden først i navnet – det er den, pc'en placerer filen efter
+    const CODE_RE = /^[CDP]\d{1,2}(?:\.[A-Z]?\d{1,2})?_/i;
+    const withCode = (n) => (codeOf() ? `${codeOf()}_${n.replace(CODE_RE, '')}` : n);
     const suggest = async () => {
       const text = desc.value.trim() || (file.type.startsWith('image/') ? `Foto ${today}` : 'Dokument');
       try {
@@ -1929,20 +1934,22 @@ class ProjectPage {
         if (best) folderSel.value = best.path;
         why.textContent = photoFolder ? 'Fotos lægges i C05.06 Foto og video (som i Windows-programmet) – vælg en anden mappe, hvis det passer bedre.'
           : c.best ? `Foreslået: ${c.best.code} ${c.best.name} (${c.probability} %)${best ? '' : ' – mappen findes ikke i projektet, vælg selv'}` : '';
-        if (auto) name.value = `${(c.filename || text).replace(/^[CDP]\d{1,2}(?:\.[A-Z]?\d{1,2})?_/i, codeOf() ? `${codeOf()}_` : '')}${ext}`;
+        if (auto) name.value = `${withCode(c.filename || text)}${ext}`;
       } catch (err) { why.textContent = err.message; }
     };
     desc.addEventListener('input', debounce(suggest, 400));
     folderSel.addEventListener('change', () => {
-      if (auto || /^[CDP]\d/i.test(name.value)) name.value = name.value.replace(/^[CDP]\d{1,2}(?:\.[A-Z]?\d{1,2})?_/i, `${codeOf()}_`);
+      if (auto || CODE_RE.test(name.value)) name.value = withCode(name.value);
     });
     const preview = file.type.startsWith('image/') ? h('img', { class: 'upload-preview', alt: '', src: URL.createObjectURL(file) }) : null;
     const where = () => `${this.project.where ? `${this.project.where} › ` : `${this.project.name} › `}${folderSel.value.split('/').join(' › ')}`;
     const share = async () => {
-      const finalName = (name.value.trim() || file.name).replace(/[\\/:*?"<>|]+/g, ' ');
+      let finalName = (name.value.trim() || file.name).replace(/[\\/:*?"<>|]+/g, ' ');
+      if (inbox && codeOf() && !finalName.toUpperCase().startsWith(`${codeOf()}_`.toUpperCase())) finalName = withCode(finalName);
       const out = new File([file], finalName.endsWith(ext) || !ext ? finalName : finalName + ext, { type: file.type });
-      await shareFile(out, where());
+      await shareFile(out, inbox || where());
     };
+    const inbox = this.project.inbox || '';
     d.doc.replaceChildren(
       h('h1', {}, '📷 Ny fil til projektet'),
       preview,
@@ -1950,11 +1957,21 @@ class ProjectPage {
       h('div', { class: 'field' }, h('label', {}, 'Mappe'), folderSel),
       why,
       h('div', { class: 'field' }, h('label', {}, 'A104-filnavn'), name),
-      h('div', { class: 'toolbar', style: 'margin-top:12px' }, h('button', { type: 'button', class: 'btn primary', onclick: share }, '📤 Del til OneDrive / Teams')),
-      h('ol', { class: 'steps' },
-        h('li', {}, 'Tryk »Del til OneDrive / Teams«, og vælg ', h('b', {}, 'OneDrive'), ' (eller Teams) i delingsmenuen.'),
-        h('li', {}, 'Gem filen i mappen: ', h('b', {}, h('span', { class: 'upload-where' }, ''))),
-        h('li', {}, 'På pc’en står filen derefter som ', h('i', {}, '⏳ Mangler godkendelse'), ', til en på holdet godkender den (Godkendt af …).')));
+      inbox ? h('div', { class: 'toolbar', style: 'margin-top:12px' },
+        h('button', { type: 'button', class: 'btn primary', onclick: share }, '📤 Send til projektet'))
+        : h('div', { class: 'toolbar', style: 'margin-top:12px' },
+          h('button', { type: 'button', class: 'btn primary', onclick: share }, '📤 Del til OneDrive / Teams')),
+      inbox ? h('ol', { class: 'steps' },
+        h('li', {}, 'Tryk »Send til projektet«, og vælg ', h('b', {}, 'OneDrive'), ' i delingsmenuen.'),
+        h('li', {}, 'Gem filen i: ', h('b', { class: 'break' }, inbox), ' – det er den samme mappe hver gang.'),
+        h('li', {}, 'A104 Navigator på pc’en lægger den selv i ', h('b', {}, h('span', { class: 'upload-where' }, '')),
+          ' og skriver den i Loggen som ', h('i', {}, '⏳ Mangler godkendelse'), ', til en på holdet godkender den.'),
+        h('li', { class: 'muted' }, 'Det sker, når programmet kører på pc’en med projektet åbent.'))
+        : h('ol', { class: 'steps' },
+          h('li', {}, 'Tryk »Del til OneDrive / Teams«, og vælg ', h('b', {}, 'OneDrive'), ' (eller Teams) i delingsmenuen.'),
+          h('li', {}, 'Gem filen i mappen: ', h('b', {}, h('span', { class: 'upload-where' }, ''))),
+          h('li', {}, 'På pc’en står filen derefter som ', h('i', {}, '⏳ Mangler godkendelse'), ', til en på holdet godkender den (Godkendt af …).'),
+          h('li', { class: 'muted' }, 'Tip: Scan projektet igen fra »📱 Mobil (beta)« på pc’en, så lægger pc’en selv filen på plads.')));
     const whereEl = d.doc.querySelector('.upload-where');
     const syncWhere = () => { whereEl.textContent = where(); };
     folderSel.addEventListener('change', syncWhere);
