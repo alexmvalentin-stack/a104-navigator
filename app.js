@@ -2,8 +2,8 @@
 // A104 Navigator – web-app (PWA). Brugerfladen er skrevet her; al logik (søgning, dokumentfinder, BR18, AB 18 …)
 // er A104 Navigators egen Python-kerne, der kører i worker.js med Pyodide.
 
-const BUILD = '2.18.0-66b146f74e';
-const VERSION = '2.18.0';
+const BUILD = '2.19.0-39e45e9e33';
+const VERSION = '2.19.0';
 
 // =========================================================================== hjælpere
 const $ = (sel, el = document) => el.querySelector(sel);
@@ -132,7 +132,7 @@ function api(fn, ...args) {
 }
 
 // =========================================================================== tilstand
-const prefs = { theme: 'system', projectId: '', includePid: false };
+const prefs = { theme: 'system', projectId: '', includePid: false, openFiles: 'browser' };
 let meta = {};
 let installPrompt = null;
 const cache = {};
@@ -143,6 +143,21 @@ function applyTheme() {
   const dark = prefs.theme === 'dark' || (prefs.theme === 'system' && matchMedia('(prefers-color-scheme: dark)').matches);
   $('#theme-toggle').textContent = dark ? '☀️  Lys tilstand' : '🌙  Mørk tilstand';
   $('meta[name="theme-color"]').content = dark ? '#131519' : '#0F2C4C';
+}
+
+// Filer og mapper i OneDrive/Teams. Et tryk på et SharePoint-link åbner Teams- eller OneDrive-appen, og så lander
+// »tilbage« i Teams. Som standard åbnes linket derfor i browseren oven på A104 (luk den, så er du tilbage i appen):
+// et tomt vindue først og selve adressen lidt efter, uden for trykket, så telefonen ikke sender den videre til appen.
+function openExternal(url) {
+  if (prefs.openFiles === 'app') { window.open(url, '_blank', 'noopener'); return; }
+  const w = window.open('', '_blank');
+  if (!w) { window.open(url, '_blank', 'noopener'); return; }
+  try {
+    w.opener = null;
+    w.document.title = 'Åbner…';
+    w.document.body.innerHTML = '<p style="font:16px system-ui;padding:24px;color:#555">Åbner filen i browseren…</p>';
+  } catch { /* vinduet er måske allerede navigeret */ }
+  setTimeout(() => { w.location.replace(url); }, 700);
 }
 
 async function savePrefs() {
@@ -1440,6 +1455,25 @@ async function snapshotFromQr(text) {
     truncated: data.t, items };
 }
 
+/** Kameraets/scannerens egne navne (IMG_1234, DSC0042, Scan 3 …) – de siger ikke, hvad filen er. */
+const GENERIC_NAME_RE = /^(img|image|dsc|pxl|photo|foto|scan|document|dokument)[\s_-]*\d*$/i;
+
+/** Send en fil videre med telefonens Del-menu (OneDrive/Teams) – eller hent den, hvor Del ikke findes. */
+async function shareFile(file, target) {
+  if (navigator.canShare && navigator.canShare({ files: [file] })) {
+    try {
+      await navigator.share({ files: [file], title: file.name });
+      toast(`Husk at gemme i: ${target}`);
+    } catch (err) { if (err.name !== 'AbortError') toast(`Kunne ikke dele: ${err.message}`); }
+  } else {
+    const a = h('a', { href: URL.createObjectURL(file), download: file.name });
+    document.body.append(a);
+    a.click();
+    a.remove();
+    toast(`Filen er hentet – læg den i: ${target}`);
+  }
+}
+
 /** Mangler filen godkendelse? (»Mangler godkendelse« / »Ændret – mangler godkendelse« fra Windows-programmet) */
 const pendingApproval = (f) => /mangler godkendelse/i.test(f.approval || '');
 
@@ -1468,7 +1502,7 @@ class ProjectPage {
           h('ol', { class: 'steps' },
             h('li', {}, 'Åbn projektet i A104 Navigator på pc’en (Windows-programmet), og tryk ', h('b', {}, '📱 Mobil (beta)'), '.'),
             h('li', {}, 'Tryk herunder, og hold telefonen mod QR-koden på pc’en, til der står ', h('i', {}, 'Gemt'), '.')),
-          h('button', { type: 'button', class: 'btn primary', onclick: () => this.scan() }, '📷 Scan fra pc'),
+          h('button', { type: 'button', class: 'btn primary', onclick: () => this.scanQr() }, '📷 Scan fra pc'),
           h('p', { class: 'muted' }, 'Kun mappe- og filnavne overføres – intet filindhold, intet login, intet internet.')),
         h('div', { class: 'card' }, h('h2', {}, 'Åbn projekt fra OneDrive'),
           h('ol', { class: 'steps' },
@@ -1476,6 +1510,12 @@ class ProjectPage {
             h('li', {}, 'Tryk herunder, vælg OneDrive, og vælg projektets fil (fx ', h('i', {}, 'BKN-MIL-F26-2H-G1.json'), ').')),
           h('button', { type: 'button', class: 'btn', onclick: () => this.pickFile() }, '📂 Vælg projektfil'),
           h('p', { class: 'muted' }, 'Filen indeholder kun mappe- og filnavne – intet filindhold. Filerne åbnes i OneDrive/Teams med dit almindelige Microsoft-login.')),
+        h('div', { class: 'card' }, h('h2', {}, 'Tjek filer fra telefonen'),
+          h('ol', { class: 'steps' },
+            h('li', {}, 'Tryk herunder, vælg ', h('b', {}, 'OneDrive'), ' (iPhone: »Gennemse« › OneDrive · Android: ☰ › OneDrive), og markér en eller flere filer.'),
+            h('li', {}, 'Du ser, om navnet følger A104, hvilken mappe filen hører til i, og et forslag til nyt navn.')),
+          h('button', { type: 'button', class: 'btn', onclick: () => this.pickCheck() }, '🔍 Vælg filer'),
+          h('p', { class: 'muted' }, 'Intet login og intet internet – filerne bliver på telefonen. Omdøb og flyt dem bagefter i OneDrive-appen.')),
         recent.length ? h('div', { class: 'card' }, h('h2', {}, 'Tidligere projekter'), h('div', { class: 'list' },
           recent.map((p) => row({ title: `📁 ${p.name}`, sub: p.where }, () => this.choose(p, false))))) : null,
         MS.configured ? h('div', { class: 'card' }, h('h2', {}, 'Direkte fra OneDrive'),
@@ -1491,6 +1531,63 @@ class ProjectPage {
     input.click();
   }
 
+  /** Filer fra telefonens filvælger (OneDrive vises der som et sted at hente filer). Appen kan ikke selv læse
+   *  OneDrive uden Microsoft-login, men filvælgeren kan – og kun navnene bruges. */
+  pickCheck() {
+    const input = h('input', { type: 'file', multiple: true, hidden: true });
+    input.addEventListener('change', () => { if (input.files.length) this.showCheck([...input.files]); input.remove(); });
+    document.body.append(input);
+    input.click();
+  }
+
+  async showCheck(files) {
+    const inProject = !!(this.project && this.status && this.folderItems);
+    const back = () => (this.project ? this.openProject() : this.showStart());
+    this.reset();
+    const list = h('div', { class: 'settings' }, h('p', { class: 'empty' }, 'Tjekker filerne…'));
+    this.root.append(pageHead('Tjek filer', `${files.length} ${files.length === 1 ? 'fil' : 'filer'} fra telefonen`
+      + (inProject ? ` · sammenlignet med ${this.project.name}` : '')),
+    h('div', { class: 'toolbar' }, h('button', { type: 'button', class: 'btn', onclick: back }, `‹ ${this.project ? this.project.name : 'Projekt'}`),
+      h('button', { type: 'button', class: 'btn primary', onclick: () => this.pickCheck() }, '🔍 Vælg andre filer')),
+    list);
+    // Fotos med kameraets tal-navn (IMG_1234) hedder »Foto <dato>« – som under »📷 Foto / dokument«
+    const names = files.map((f) => {
+      const dot = f.name.lastIndexOf('.');
+      return f.type.startsWith('image/') && GENERIC_NAME_RE.test(dot > 0 ? f.name.slice(0, dot) : f.name)
+        ? `Foto ${new Date(f.lastModified || Date.now()).toISOString().slice(0, 10)}${dot > 0 ? f.name.slice(dot) : '.jpg'}` : f.name;
+    });
+    let res;
+    try {
+      res = await api('check_files', names, this.project?.projectId || prefs.projectId || '');
+    } catch (err) { list.replaceChildren(h('p', { class: 'warn-text' }, err.message)); return; }
+    const projectFolder = (code) => (inProject ? [...this.folderItems.values()].find((f) => this.status.folders[f.path]?.code === code
+      && this.status.folders[f.path].own) : null);
+    const good = res.filter((r) => r.ok).length;
+    list.replaceChildren(
+      h('p', {}, h('span', { class: 'ok-text' }, `✓ ${good} følger A104`), ' · ', h('span', { class: 'warn-text' }, `⚠ ${res.length - good} med bemærkninger`)),
+      ...res.map((r, i) => {
+        const file = files[i];
+        r.file = file.name;
+        const rename = r.name && r.name !== r.file;
+        const pf = r.code ? projectFolder(r.code) : null;
+        const target = pf ? `${this.project.where ? `${this.project.where} › ` : `${this.project.name} › `}${pf.path.split('/').join(' › ')}`
+          : r.code ? `${r.code} ${r.folder}` : '';
+        return h('div', { class: 'card' },
+          h('h2', { class: 'break' }, r.file),
+          h('p', { class: r.ok ? 'ok-text' : 'warn-text' }, `${r.ok ? '✓' : '⚠'} ${r.message}`),
+          r.code ? h('p', {}, 'Mappe: ', h('a', { href: `tree:${r.code}` }, `${r.code} ${r.folder}`),
+            r.probability < 100 ? h('span', { class: 'muted' }, ` (${r.probability} %)`) : null) : null,
+          r.path ? h('p', { class: 'muted' }, r.path) : null,
+          pf ? h('p', {}, 'I projektet: ', h('b', {}, pf.path.split('/').join(' › '))) : inProject && r.code
+            ? h('p', { class: 'warn-text' }, `Mappen ${r.code} findes ikke i projektet.`) : null,
+          rename ? h('p', {}, 'Nyt navn: ', h('code', { class: 'break' }, r.name), ' ',
+            h('button', { type: 'button', class: 'btn flat', onclick: () => copyText(r.name) }, '⧉ Kopiér')) : null,
+          rename ? h('div', { class: 'toolbar' }, h('button', { type: 'button', class: 'btn', title: 'Send en kopi med det nye navn til OneDrive/Teams',
+            onclick: () => shareFile(new File([file], r.name, { type: file.type }), target) }, '📤 Del med nyt navn')) : null,
+          r.reason || r.error ? h('p', { class: 'muted' }, r.reason || r.error) : null);
+      }));
+  }
+
   async importFile(file) {
     let data;
     try { data = JSON.parse(await file.text()); } catch { data = null; }
@@ -1501,7 +1598,7 @@ class ProjectPage {
     await this.saveSnapshot(data, file.name.replace(/\.json$/i, ''));
   }
 
-  async scan() {
+  async scanQr() {
     try {
       await this.saveSnapshot(await snapshotFromQr(await scanFrames()), 'Projekt');
     } catch (err) {
@@ -1523,7 +1620,7 @@ class ProjectPage {
   update(params) {
     if (!params.get('scan')) return;
     navigate('project', {}, { replace: true }); // QR-koden til appen (#/project?scan=1) starter scanneren
-    this.scan();
+    this.scanQr();
   }
 
   reset(fill = false) {
@@ -1597,8 +1694,8 @@ class ProjectPage {
       const files = kids.length - subs.length;
       list.replaceChildren(...subs.map((k) => row({ title: `📁 ${k.name}`, score: k.folder.childCount ? String(k.folder.childCount) : '' },
         () => this.browse({ driveId: folder.driveId, itemId: k.id, name: k.name, url: k.webUrl }, trail))),
-      files ? h('p', { class: 'muted' }, `${files} filer i mappen`) : null,
-      !kids.length ? h('p', { class: 'muted' }, 'Mappen er tom.') : null);
+      files ? h('p', { class: 'muted' }, `${files} filer i mappen`) : '',
+      !kids.length ? h('p', { class: 'muted' }, 'Mappen er tom.') : '');
     } catch (err) { this.failed(err); }
   }
 
@@ -1629,14 +1726,14 @@ class ProjectPage {
     this.onlyPending = h('input', { type: 'checkbox' });
     this.onlyPending.addEventListener('change', () => this.showFolder(this.folder));
     this.refreshBtn = p.source === 'file'
-      ? h('button', { type: 'button', class: 'btn', onclick: () => this.scan(), title: 'Scan QR-koden fra »📱 Mobil (beta)« på pc’en igen' }, '📷 Opdatér (scan)')
+      ? h('button', { type: 'button', class: 'btn', onclick: () => this.scanQr(), title: 'Scan QR-koden fra »📱 Mobil (beta)« på pc’en igen' }, '📷 Opdatér (scan)')
       : h('button', { type: 'button', class: 'btn', onclick: () => this.load(true) }, '⟳ Opdater');
     const list = listPane();
     this.scroll = list.scroll;
     this.detail = new Pane({ empty: 'Vælg en mappe.' });
     this.detail.tool('Åbn i OneDrive', () => {
       const url = this.folderUrl();
-      if (url) window.open(url, '_blank', 'noopener'); else toast('Projektet ligger kun på pc’en – det er ikke i OneDrive/Teams.');
+      if (url) openExternal(url); else toast('Projektet ligger kun på pc’en – det er ikke i OneDrive/Teams.');
     }, 'Åbn mappen i OneDrive/Teams');
     this.split = h('div', { class: 'split' }, list.el, this.detail.el);
     this.root.append(
@@ -1644,6 +1741,7 @@ class ProjectPage {
       h('div', { class: 'toolbar' }, this.filter, h('label', { class: 'check' }, this.onlyIssues, 'Kun filer med bemærkninger'),
         h('label', { class: 'check' }, this.onlyPending, '⏳ Mangler godkendelse'),
         h('button', { type: 'button', class: 'btn primary', onclick: () => this.pickUpload() }, '📷 Foto / dokument'),
+        h('button', { type: 'button', class: 'btn', onclick: () => this.pickCheck(), title: 'Vælg filer fra OneDrive på telefonen og tjek navngivningen' }, '🔍 Tjek filer'),
         this.refreshBtn, h('button', { type: 'button', class: 'btn', onclick: () => this.showStart() }, 'Skift projekt')),
       this.split);
     this.scroll.append(h('p', { class: 'empty' }, 'Henter projektet…'));
@@ -1809,7 +1907,7 @@ class ProjectPage {
     const d = this.detail;
     const dot = file.name.lastIndexOf('.');
     const ext = dot > 0 ? file.name.slice(dot).toLowerCase() : (file.type === 'image/jpeg' ? '.jpg' : '');
-    const generic = /^(img|image|dsc|pxl|photo|foto|scan|document|dokument)[\s_-]*\d*$/i.test(dot > 0 ? file.name.slice(0, dot) : file.name);
+    const generic = GENERIC_NAME_RE.test(dot > 0 ? file.name.slice(0, dot) : file.name);
     const today = new Date().toISOString().slice(0, 10);
     const desc = h('input', { type: 'text', value: generic ? '' : file.name.slice(0, dot > 0 ? dot : undefined).replace(/[_-]+/g, ' '),
       placeholder: 'Hvad er det? fx Foto af fundament, Referat byggemøde' });
@@ -1843,19 +1941,7 @@ class ProjectPage {
     const share = async () => {
       const finalName = (name.value.trim() || file.name).replace(/[\\/:*?"<>|]+/g, ' ');
       const out = new File([file], finalName.endsWith(ext) || !ext ? finalName : finalName + ext, { type: file.type });
-      const target = where();
-      if (navigator.canShare && navigator.canShare({ files: [out] })) {
-        try {
-          await navigator.share({ files: [out], title: out.name });
-          toast(`Husk at gemme i: ${target}`);
-        } catch (err) { if (err.name !== 'AbortError') toast(`Kunne ikke dele: ${err.message}`); }
-      } else {
-        const a = h('a', { href: URL.createObjectURL(out), download: out.name });
-        document.body.append(a);
-        a.click();
-        a.remove();
-        toast(`Filen er hentet – læg den i: ${target}`);
-      }
+      await shareFile(out, where());
     };
     d.doc.replaceChildren(
       h('h1', {}, '📷 Ny fil til projektet'),
@@ -1887,9 +1973,9 @@ class ProjectPage {
       h('p', {}, h('a', { href: '#', onclick: (e) => { e.preventDefault(); this.showFolder(parent, { reveal: false }); } }, `‹ ${parent ? parent.split('/').pop() : this.project.name}`)),
       h('h1', { class: 'break' }, f.name),
       h('p', { class: ok ? 'ok-text' : 'warn-text' }, `${ok ? '✓' : '⚠'} ${message}`),
-      f.approval ? h('p', { class: pendingApproval(f) ? 'warn-text' : 'ok-text' }, `${pendingApproval(f) ? '⏳' : '✔'} ${f.approval}`) : null,
+      f.approval ? h('p', { class: pendingApproval(f) ? 'warn-text' : 'ok-text' }, `${pendingApproval(f) ? '⏳' : '✔'} ${f.approval}`) : '',
       h('p', { class: 'muted' }, [`Ændret ${fmtDate(f.modified)}`, f.by ? `af ${f.by}` : '', fmtSize(f.size)].filter(Boolean).join(' · ')),
-      h('div', { class: 'toolbar' }, f.url ? h('a', { class: 'btn primary', href: f.url, target: '_blank', rel: 'noopener' }, 'Åbn fil')
+      h('div', { class: 'toolbar' }, f.url ? h('button', { type: 'button', class: 'btn primary', onclick: () => openExternal(f.url) }, 'Åbn fil')
         : h('span', { class: 'muted' }, 'Filen ligger kun på pc’en – den er ikke i OneDrive/Teams.')),
       suggestion);
     d.body.scrollTop = 0;
@@ -1985,6 +2071,19 @@ class SettingsPage {
       h('div', { class: 'muted' }, 'Bruges af Dokumentfinderen og navnebyggeren.'),
       h('div', { class: 'field' }, h('label', {}, 'Projekt-ID'), pid),
       h('label', { class: 'check', style: 'margin-top:10px' }, inc, 'Sæt projekt-ID foran model- og dokumentfilnavne')));
+
+    const opens = h('div', { class: 'seg', role: 'group', 'aria-label': 'Åbn filer' });
+    for (const [key, label] of [['browser', 'I browseren'], ['app', 'I Teams/OneDrive-appen']]) {
+      opens.append(h('button', { type: 'button', 'aria-pressed': String(prefs.openFiles === key), onclick: async (e) => {
+        prefs.openFiles = key;
+        opens.querySelectorAll('button').forEach((b) => b.setAttribute('aria-pressed', String(b === e.currentTarget)));
+        await savePrefs();
+      } }, label));
+    }
+    wrap.append(h('div', { class: 'card' }, h('h2', {}, 'Åbn filer fra Projekt'), opens,
+      h('div', { class: 'muted', style: 'margin-top:8px' }, 'I browseren: luk den, så er du tilbage i A104. '
+        + 'Første gang skal du måske logge ind med din skolekonto. I appen: filen åbner i Teams/OneDrive, '
+        + 'og du skal selv skifte tilbage til A104.')));
 
     const offline = h('div', { class: 'muted' }, 'Tjekker…');
     const app = h('div', { class: 'card' }, h('h2', {}, 'App og offline'), offline);
