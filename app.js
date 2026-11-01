@@ -2,7 +2,7 @@
 // A104 Navigator – web-app (PWA). Brugerfladen er skrevet her; al logik (søgning, dokumentfinder, BR18, AB 18 …)
 // er A104 Navigators egen Python-kerne, der kører i worker.js med Pyodide.
 
-const BUILD = '2.18.0-0925f9a716';
+const BUILD = '2.18.0-66b146f74e';
 const VERSION = '2.18.0';
 
 // =========================================================================== hjælpere
@@ -1431,13 +1431,17 @@ async function snapshotFromQr(text) {
   const base = (data.u || '').replace(/\/$/, '');
   const urlFor = (path, file) => (base ? `${base}/${path.split('/').map(encodeURIComponent).join('/')}${file ? '?web=1' : ''}` : '');
   const items = data.d.map((p) => ({ path: p, folder: true, url: urlFor(p, false) }));
-  for (const [dir, name, size, minutes, by] of data.f) {
+  for (const [dir, name, size, minutes, by, approval] of data.f) {
     const path = dirs[dir] ? `${dirs[dir]}/${name}` : name;
-    items.push({ path, folder: false, size, modified: new Date(minutes * 60000).toISOString(), url: urlFor(path, true), by: by || '' });
+    items.push({ path, folder: false, size, modified: new Date(minutes * 60000).toISOString(), url: urlFor(path, true), by: by || '',
+      approval: approval || '' });
   }
   return { format: 'a104-projekt', project: { name: data.n, project_id: data.p, where: data.w, url: data.u }, created: data.c,
     truncated: data.t, items };
 }
+
+/** Mangler filen godkendelse? (»Mangler godkendelse« / »Ændret – mangler godkendelse« fra Windows-programmet) */
+const pendingApproval = (f) => /mangler godkendelse/i.test(f.approval || '');
 
 class ProjectPage {
   constructor(root, params) {
@@ -1510,7 +1514,7 @@ class ProjectPage {
     const name = pr.name || fallbackName;
     const p = { id: `file:${name}`, source: 'file', name, where: pr.where || '', url: pr.url || '', projectId: pr.project_id || '' };
     const items = data.items.map((i) => ({ id: i.path, name: i.path.split('/').pop(), path: i.path, folder: !!i.folder, size: i.size || 0,
-      modified: i.modified || '', url: i.url || '', by: i.by || '' }));
+      modified: i.modified || '', url: i.url || '', by: i.by || '', approval: i.approval || '' }));
     await store.set(`project-scan:${p.id}`, { at: data.created || new Date().toISOString(), truncated: !!data.truncated, items, file: true });
     await this.choose(p, false);
     toast(`Gemt på telefonen: ${name}`);
@@ -1622,6 +1626,8 @@ class ProjectPage {
     this.filter.addEventListener('input', debounce(() => this.showFolder(this.folder), 150));
     this.onlyIssues = h('input', { type: 'checkbox' });
     this.onlyIssues.addEventListener('change', () => this.showFolder(this.folder));
+    this.onlyPending = h('input', { type: 'checkbox' });
+    this.onlyPending.addEventListener('change', () => this.showFolder(this.folder));
     this.refreshBtn = p.source === 'file'
       ? h('button', { type: 'button', class: 'btn', onclick: () => this.scan(), title: 'Scan QR-koden fra »📱 Mobil (beta)« på pc’en igen' }, '📷 Opdatér (scan)')
       : h('button', { type: 'button', class: 'btn', onclick: () => this.load(true) }, '⟳ Opdater');
@@ -1636,6 +1642,8 @@ class ProjectPage {
     this.root.append(
       h('div', { class: 'page-head' }, h('h1', {}, `📁 ${p.name}`), this.summary),
       h('div', { class: 'toolbar' }, this.filter, h('label', { class: 'check' }, this.onlyIssues, 'Kun filer med bemærkninger'),
+        h('label', { class: 'check' }, this.onlyPending, '⏳ Mangler godkendelse'),
+        h('button', { type: 'button', class: 'btn primary', onclick: () => this.pickUpload() }, '📷 Foto / dokument'),
         this.refreshBtn, h('button', { type: 'button', class: 'btn', onclick: () => this.showStart() }, 'Skift projekt')),
       this.split);
     this.scroll.append(h('p', { class: 'empty' }, 'Henter projektet…'));
@@ -1672,8 +1680,10 @@ class ProjectPage {
     this.status = status;
     const s = status.summary;
     const when = fmtDate(scan.at);
+    const waiting = scan.items.filter((i) => !i.folder && pendingApproval(i)).length;
     this.summary.innerHTML = `${esc(this.project.where || '')}${this.project.where ? ' · ' : ''}<b>${s.files}</b> filer i ${s.folders} mapper · `
       + `<span class="ok-text">✓ ${s.ok} følger A104</span> · <span class="warn-text">⚠ ${s.issues} med bemærkninger</span>`
+      + (waiting ? ` · <span class="warn-text">⏳ ${waiting} mangler godkendelse</span>` : '')
       + `<br><span class="muted">${scan.file ? 'Gemt fra Windows-programmet' : 'Hentet'} ${esc(when)}${scan.truncated ? ` · kun de første ${SCAN_LIMIT} elementer` : ''}</span>`;
     this.buildTree();
     const keep = this.folder != null && (this.folder === '' || status.folders[this.folder]) ? this.folder : '';
@@ -1735,7 +1745,8 @@ class ProjectPage {
   fileRow(f, showPath) {
     const [ok, message] = this.status.files[f.id];
     const parent = f.path.includes('/') ? f.path.slice(0, f.path.lastIndexOf('/')) : '';
-    const sub = [showPath ? (parent || this.project.name) : '', ok ? '' : message, fmtDate(f.modified) + (f.by ? ` · ${f.by}` : '')].filter(Boolean).join(' · ');
+    const sub = [showPath ? (parent || this.project.name) : '', f.approval ? `${pendingApproval(f) ? '⏳' : '✔'} ${f.approval}` : '',
+      ok ? '' : message, fmtDate(f.modified) + (f.by ? ` · ${f.by}` : '')].filter(Boolean).join(' · ');
     const r = row({ code: ok ? '✓' : '⚠', title: f.name, sub }, () => this.showFile(f));
     r.querySelector('.r-code').classList.add(ok ? 'ok-text' : 'warn-text');
     return r;
@@ -1746,14 +1757,15 @@ class ProjectPage {
     this.folder = path ?? '';
     const text = this.filter.value.trim().toLowerCase();
     const issues = this.onlyIssues.checked;
+    const pending = this.onlyPending.checked;
     const d = this.detail;
     d.doc.replaceChildren();
     d.body.scrollTop = 0;
-    if (text || issues) {
+    if (text || issues || pending) {
       const key = codeKey(text);
-      const hits = this.files.filter((f) => (!issues || !this.status.files[f.id][0])
+      const hits = this.files.filter((f) => (!issues || !this.status.files[f.id][0]) && (!pending || pendingApproval(f))
         && (!text || f.path.toLowerCase().includes(text) || (key && codeKey(f.name).startsWith(key))));
-      d.doc.append(h('h1', {}, text ? `Filer med »${this.filter.value.trim()}«` : 'Filer med bemærkninger'),
+      d.doc.append(h('h1', {}, text ? `Filer med »${this.filter.value.trim()}«` : pending ? 'Mangler godkendelse' : 'Filer med bemærkninger'),
         h('p', { class: 'muted' }, `${hits.length} filer i hele projektet${hits.length > 300 ? ' – de første 300 vises' : ''}`),
         h('div', { class: 'list' }, hits.slice(0, 300).map((f) => this.fileRow(f, true))));
       select(this.tree, null);
@@ -1783,6 +1795,89 @@ class ProjectPage {
     if (reveal) d.reveal();
   }
 
+  pickUpload() {
+    const input = h('input', { type: 'file', accept: 'image/*,application/pdf,.doc,.docx,.xls,.xlsx,.ppt,.pptx,.dwg,.ifc,.txt', hidden: true });
+    input.addEventListener('change', () => { if (input.files[0]) this.showUpload(input.files[0]); input.remove(); });
+    document.body.append(input);
+    input.click();
+  }
+
+  /** En ny fil fra telefonen: find mappe og A104-navn, og send den videre til OneDrive/Teams (Del). Appen må ikke
+   *  selv skrive i skolens OneDrive – det gør OneDrive-/Teams-appen. På pc'en står filen derefter som
+   *  »Mangler godkendelse«, til en på holdet godkender den. */
+  showUpload(file) {
+    const d = this.detail;
+    const dot = file.name.lastIndexOf('.');
+    const ext = dot > 0 ? file.name.slice(dot).toLowerCase() : (file.type === 'image/jpeg' ? '.jpg' : '');
+    const generic = /^(img|image|dsc|pxl|photo|foto|scan|document|dokument)[\s_-]*\d*$/i.test(dot > 0 ? file.name.slice(0, dot) : file.name);
+    const today = new Date().toISOString().slice(0, 10);
+    const desc = h('input', { type: 'text', value: generic ? '' : file.name.slice(0, dot > 0 ? dot : undefined).replace(/[_-]+/g, ' '),
+      placeholder: 'Hvad er det? fx Foto af fundament, Referat byggemøde' });
+    const folders = [...this.folderItems.values()].filter((f) => this.status.folders[f.path]?.own)
+      .map((f) => ({ path: f.path, code: this.status.folders[f.path].code }))
+      .sort((a, b) => a.path.localeCompare(b.path, 'da', { numeric: true }));
+    const folderSel = h('select', { 'aria-label': 'Mappe' }, folders.map((f) => option(f.path, `${f.path.split('/').pop()}`, false)));
+    const name = h('input', { type: 'text', 'aria-label': 'Filnavn' });
+    const why = h('p', { class: 'muted' }, '');
+    let auto = true;
+    name.addEventListener('input', () => { auto = false; });
+    const codeOf = () => this.status.folders[folderSel.value]?.code || '';
+    const suggest = async () => {
+      const text = desc.value.trim() || (file.type.startsWith('image/') ? `Foto ${today}` : 'Dokument');
+      try {
+        const c = await api('classify', text, this.project.projectId || prefs.projectId || '', prefs.includePid);
+        const photoFolder = file.type.startsWith('image/') && folders.find((f) => f.code === 'C05.06');
+        const best = photoFolder || (c.best && folders.find((f) => f.code === c.best.code));
+        if (best) folderSel.value = best.path;
+        why.textContent = photoFolder ? 'Fotos lægges i C05.06 Foto og video (som i Windows-programmet) – vælg en anden mappe, hvis det passer bedre.'
+          : c.best ? `Foreslået: ${c.best.code} ${c.best.name} (${c.probability} %)${best ? '' : ' – mappen findes ikke i projektet, vælg selv'}` : '';
+        if (auto) name.value = `${(c.filename || text).replace(/^[CDP]\d{1,2}(?:\.[A-Z]?\d{1,2})?_/i, codeOf() ? `${codeOf()}_` : '')}${ext}`;
+      } catch (err) { why.textContent = err.message; }
+    };
+    desc.addEventListener('input', debounce(suggest, 400));
+    folderSel.addEventListener('change', () => {
+      if (auto || /^[CDP]\d/i.test(name.value)) name.value = name.value.replace(/^[CDP]\d{1,2}(?:\.[A-Z]?\d{1,2})?_/i, `${codeOf()}_`);
+    });
+    const preview = file.type.startsWith('image/') ? h('img', { class: 'upload-preview', alt: '', src: URL.createObjectURL(file) }) : null;
+    const where = () => `${this.project.where ? `${this.project.where} › ` : `${this.project.name} › `}${folderSel.value.split('/').join(' › ')}`;
+    const share = async () => {
+      const finalName = (name.value.trim() || file.name).replace(/[\\/:*?"<>|]+/g, ' ');
+      const out = new File([file], finalName.endsWith(ext) || !ext ? finalName : finalName + ext, { type: file.type });
+      const target = where();
+      if (navigator.canShare && navigator.canShare({ files: [out] })) {
+        try {
+          await navigator.share({ files: [out], title: out.name });
+          toast(`Husk at gemme i: ${target}`);
+        } catch (err) { if (err.name !== 'AbortError') toast(`Kunne ikke dele: ${err.message}`); }
+      } else {
+        const a = h('a', { href: URL.createObjectURL(out), download: out.name });
+        document.body.append(a);
+        a.click();
+        a.remove();
+        toast(`Filen er hentet – læg den i: ${target}`);
+      }
+    };
+    d.doc.replaceChildren(
+      h('h1', {}, '📷 Ny fil til projektet'),
+      preview,
+      h('div', { class: 'field' }, h('label', {}, 'Hvad er det?'), desc),
+      h('div', { class: 'field' }, h('label', {}, 'Mappe'), folderSel),
+      why,
+      h('div', { class: 'field' }, h('label', {}, 'A104-filnavn'), name),
+      h('div', { class: 'toolbar', style: 'margin-top:12px' }, h('button', { type: 'button', class: 'btn primary', onclick: share }, '📤 Del til OneDrive / Teams')),
+      h('ol', { class: 'steps' },
+        h('li', {}, 'Tryk »Del til OneDrive / Teams«, og vælg ', h('b', {}, 'OneDrive'), ' (eller Teams) i delingsmenuen.'),
+        h('li', {}, 'Gem filen i mappen: ', h('b', {}, h('span', { class: 'upload-where' }, ''))),
+        h('li', {}, 'På pc’en står filen derefter som ', h('i', {}, '⏳ Mangler godkendelse'), ', til en på holdet godkender den (Godkendt af …).')));
+    const whereEl = d.doc.querySelector('.upload-where');
+    const syncWhere = () => { whereEl.textContent = where(); };
+    folderSel.addEventListener('change', syncWhere);
+    d.body.scrollTop = 0;
+    d.reveal();
+    suggest().then(syncWhere);
+    syncWhere();
+  }
+
   async showFile(f) {
     const d = this.detail;
     const [ok, message, code] = this.status.files[f.id];
@@ -1792,6 +1887,7 @@ class ProjectPage {
       h('p', {}, h('a', { href: '#', onclick: (e) => { e.preventDefault(); this.showFolder(parent, { reveal: false }); } }, `‹ ${parent ? parent.split('/').pop() : this.project.name}`)),
       h('h1', { class: 'break' }, f.name),
       h('p', { class: ok ? 'ok-text' : 'warn-text' }, `${ok ? '✓' : '⚠'} ${message}`),
+      f.approval ? h('p', { class: pendingApproval(f) ? 'warn-text' : 'ok-text' }, `${pendingApproval(f) ? '⏳' : '✔'} ${f.approval}`) : null,
       h('p', { class: 'muted' }, [`Ændret ${fmtDate(f.modified)}`, f.by ? `af ${f.by}` : '', fmtSize(f.size)].filter(Boolean).join(' · ')),
       h('div', { class: 'toolbar' }, f.url ? h('a', { class: 'btn primary', href: f.url, target: '_blank', rel: 'noopener' }, 'Åbn fil')
         : h('span', { class: 'muted' }, 'Filen ligger kun på pc’en – den er ikke i OneDrive/Teams.')),
