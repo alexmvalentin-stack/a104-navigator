@@ -2,7 +2,7 @@
 // A104 Navigator – web-app (PWA). Brugerfladen er skrevet her; al logik (søgning, dokumentfinder, BR18, AB 18 …)
 // er A104 Navigators egen Python-kerne, der kører i worker.js med Pyodide.
 
-const BUILD = '2.19.0-2061a9f8eb';
+const BUILD = '2.19.0-c8b4bfbe4c';
 const VERSION = '2.19.0';
 
 // =========================================================================== hjælpere
@@ -1451,7 +1451,7 @@ async function snapshotFromQr(text) {
     items.push({ path, folder: false, size, modified: new Date(minutes * 60000).toISOString(), url: urlFor(path, true), by: by || '',
       approval: approval || '' });
   }
-  return { format: 'a104-projekt', project: { name: data.n, project_id: data.p, where: data.w, url: data.u, inbox: data.i || '', mark: data.m || '' }, created: data.c,
+  return { format: 'a104-projekt', project: { name: data.n, project_id: data.p, where: data.w, url: data.u, inbox: data.i || '', mark: data.m || '', relay: data.r || '' }, created: data.c,
     truncated: data.t, items };
 }
 
@@ -1472,6 +1472,17 @@ async function shareFile(file, target) {
     a.remove();
     toast(`Filen er hentet – læg den i: ${target}`);
   }
+}
+
+/** 📥 Læg i mappe over nettet: filen sendes til projektets hemmelige adresse hos ntfy.sh (fra QR-koden), og
+ *  Windows-programmet henter den derfra og lægger den på plads (phone_export.relay_fetch). Ingen delingsmenu, ingen
+ *  login – telefonen og pc'en skal bare have internet. ntfy.sh sletter filen efter 3 timer. */
+const RELAY_MAX = 15 * 1024 * 1024;
+async function sendToPc(file, project) {
+  if (file.size > RELAY_MAX) throw new Error('Filen er over 15 MB – brug »Del med OneDrive« i stedet.');
+  const url = `${project.relay}?filename=${encodeURIComponent(file.name)}&message=${encodeURIComponent(project.name)}`;
+  const r = await fetch(url, { method: 'PUT', body: file });
+  if (!r.ok) throw new Error(`Kunne ikke sende (${r.status}).`);
 }
 
 /** Mangler filen godkendelse? (»Mangler godkendelse« / »Ændret – mangler godkendelse« fra Windows-programmet) */
@@ -1610,7 +1621,7 @@ class ProjectPage {
     const pr = data.project || {};
     const name = pr.name || fallbackName;
     const p = { id: `file:${name}`, source: 'file', name, where: pr.where || '', url: pr.url || '', projectId: pr.project_id || '',
-      inbox: pr.inbox || '', mark: pr.mark || '' };
+      inbox: pr.inbox || '', mark: pr.mark || '', relay: pr.relay || '' };
     const items = data.items.map((i) => ({ id: i.path, name: i.path.split('/').pop(), path: i.path, folder: !!i.folder, size: i.size || 0,
       modified: i.modified || '', url: i.url || '', by: i.by || '', approval: i.approval || '' }));
     await store.set(`project-scan:${p.id}`, { at: data.created || new Date().toISOString(), truncated: !!data.truncated, items, file: true });
@@ -1899,14 +1910,44 @@ class ProjectPage {
     const input = h('input', { type: 'file', accept: 'image/*,application/pdf,.doc,.docx,.xls,.xlsx,.ppt,.pptx,.dwg,.ifc,.txt', hidden: true });
     input.addEventListener('change', () => {
       const file = input.files[0];
-      if (file) { if (quick && this.project.inbox) this.showQuickUpload(file); else this.showUpload(file); }
+      if (file) {
+        if (quick && this.project.relay) this.sendQuick(file);
+        else if (quick && this.project.inbox) this.showQuickUpload(file);
+        else this.showUpload(file);
+      }
       input.remove();
     });
     document.body.append(input);
     input.click();
   }
 
-  /** 📥 Læg i mappe: filen sendes, som den er, til projektets indbakke, og Windows-programmet finder selv mappen og
+  /** 📥 Læg i mappe: send filen direkte til pc'en (ntfy.sh) – den finder selv mappe, kode og navn. */
+  async sendQuick(file) {
+    const d = this.detail;
+    const preview = file.type.startsWith('image/') ? h('img', { class: 'upload-preview', alt: '', src: URL.createObjectURL(file) }) : '';
+    const status = h('p', { class: 'muted' }, 'Sender til pc’en …');
+    const actions = h('div', { class: 'toolbar', style: 'margin-top:12px' });
+    d.doc.replaceChildren(h('h1', {}, '📥 Læg i mappe'), preview, h('p', { class: 'muted break' }, `${file.name} · ${fmtSize(file.size)}`),
+      status, actions);
+    d.body.scrollTop = 0;
+    d.reveal();
+    try {
+      await sendToPc(file, this.project);
+      status.className = 'ok-text';
+      status.textContent = '✓ Sendt. A104 Navigator på pc’en finder selv den rigtige mappe, giver filen A104-kode og -navn '
+        + 'og skriver den i Loggen som ⏳ Mangler godkendelse.';
+      actions.replaceChildren(h('button', { type: 'button', class: 'btn primary', onclick: () => this.pickUpload(true) }, '📥 Læg en til i mappe'));
+      d.doc.append(h('p', { class: 'muted' }, 'Pc’en henter filen, når programmet kører – inden for 3 timer.'));
+    } catch (err) {
+      status.className = 'warn-text';
+      status.textContent = `⚠ ${err.message === 'Failed to fetch' ? 'Ingen forbindelse – tjek internettet.' : err.message}`;
+      actions.replaceChildren(h('button', { type: 'button', class: 'btn primary', onclick: () => this.sendQuick(file) }, 'Prøv igen'),
+        h('button', { type: 'button', class: 'btn', onclick: () => (this.project.inbox ? this.showQuickUpload(file) : this.showUpload(file)) },
+          'Del med OneDrive i stedet'));
+    }
+  }
+
+  /** 📥 Læg i mappe (uden net-forbindelse til pc'en): filen sendes, som den er, til projektets indbakke, og Windows-programmet finder selv mappen og
    *  A104-navnet – ud fra navn, indhold, tekstgenkendelse og tegningshoved, ligesom »Placér korrekt«.
    *  Navnet ændres ikke her: kameraets tal-navn får pc'en til at læse billedet i stedet for at gætte ud fra navnet. */
   showQuickUpload(file) {
@@ -1980,6 +2021,10 @@ class ProjectPage {
       let finalName = (name.value.trim() || file.name).replace(/[\\/:*?"<>|]+/g, ' ');
       if (inbox && codeOf() && !finalName.toUpperCase().startsWith(`${codeOf()}_`.toUpperCase())) finalName = withCode(finalName);
       const out = new File([file], finalName.endsWith(ext) || !ext ? finalName : finalName + ext, { type: file.type });
+      if (this.project.relay) {
+        try { await sendToPc(out, this.project); toast(`✓ Sendt til pc’en – lægges i ${codeOf() || 'projektet'}`); return; }
+        catch (err) { toast(`${err.message} – deler i stedet`); }
+      }
       await shareFile(out, inbox || where());
     };
     const inbox = this.project.inbox || '';
