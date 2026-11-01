@@ -2,7 +2,7 @@
 // A104 Navigator – web-app (PWA). Brugerfladen er skrevet her; al logik (søgning, dokumentfinder, BR18, AB 18 …)
 // er A104 Navigators egen Python-kerne, der kører i worker.js med Pyodide.
 
-const BUILD = '2.18.0-13be29e9fc';
+const BUILD = '2.18.0-0925f9a716';
 const VERSION = '2.18.0';
 
 // =========================================================================== hjælpere
@@ -1300,6 +1300,145 @@ async function scanDrive(driveId, itemId, onProgress) {
   return { items, truncated: items.length >= SCAN_LIMIT };
 }
 
+// =========================================================================== 📷 Scan fra pc (beta)
+// Windows-programmets »📱 Mobil (beta)« viser en QR-kode, der skifter: »A104:<id>:<nr>/<antal>/<længde>:<data>«.
+// Data er zlib-komprimeret JSON i base45 (se app/phone_export.py). Telefonen samler koderne – intet går over nettet.
+const BASE45 = '0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZ $%*+-./:';
+
+function fromBase45(text) {
+  const out = [];
+  for (let i = 0; i < text.length; i += 3) {
+    const c = BASE45.indexOf(text[i]);
+    const d = BASE45.indexOf(text[i + 1]);
+    if (c < 0 || d < 0) throw new Error('QR-koden kunne ikke læses – prøv igen.');
+    if (i + 2 < text.length) {
+      const n = c + d * 45 + BASE45.indexOf(text[i + 2]) * 2025;
+      out.push(n >> 8, n & 255);
+    } else out.push(c + d * 45);
+  }
+  return new Uint8Array(out);
+}
+
+async function inflate(bytes) {
+  if (!('DecompressionStream' in window)) throw new Error('Telefonens browser er for gammel (kræver iOS 16.4 eller nyere Chrome).');
+  const stream = new Blob([bytes]).stream().pipeThrough(new DecompressionStream('deflate'));
+  return new Response(stream).text();
+}
+
+let jsqrLoading = null;
+function loadJsQR() {
+  if (!jsqrLoading) {
+    jsqrLoading = new Promise((resolve, reject) => {
+      const s = h('script', { src: 'jsqr.js' });
+      s.onload = () => resolve(window.jsQR);
+      s.onerror = () => { jsqrLoading = null; reject(new Error('QR-læseren kunne ikke hentes.')); };
+      document.head.append(s);
+    });
+  }
+  return jsqrLoading;
+}
+
+/** Åbner kameraet og samler den skiftende QR-kode. Giver teksten (base45) eller fejler med {cancelled}. */
+function scanFrames() {
+  return new Promise((resolve, reject) => {
+    const video = h('video', { playsinline: true, muted: true, autoplay: true });
+    const fill = h('span');
+    const status = h('p', {}, 'Starter kameraet…');
+    const cancel = h('button', { type: 'button', class: 'btn' }, 'Annullér');
+    const overlay = h('div', { class: 'scan', role: 'dialog', 'aria-label': 'Scan fra pc' },
+      h('div', { class: 'scan-box' }, h('h2', {}, '📷 Scan fra pc ', h('span', { class: 'beta' }, 'BETA')), video,
+        h('div', { class: 'scan-bar' }, fill), status,
+        h('p', { class: 'muted' }, 'Tryk »📱 Mobil (beta)« i Windows-programmet, når projektet er åbent, og hold telefonen mod den store QR-kode.'),
+        cancel));
+    document.body.append(overlay);
+    let stream = null;
+    let stopped = false;
+    const stop = () => { stopped = true; stream?.getTracks().forEach((t) => t.stop()); overlay.remove(); };
+    cancel.addEventListener('click', () => { stop(); reject(Object.assign(new Error('Annulleret'), { cancelled: true })); });
+
+    (async () => {
+      try {
+        stream = await navigator.mediaDevices.getUserMedia({ audio: false,
+          video: { facingMode: 'environment', width: { ideal: 1280 }, height: { ideal: 720 } } });
+      } catch {
+        stop();
+        reject(new Error('Appen fik ikke lov til at bruge kameraet. Giv adgang til kameraet og prøv igen.'));
+        return;
+      }
+      if (stopped) { stream.getTracks().forEach((t) => t.stop()); return; }
+      video.srcObject = stream;
+      await video.play().catch(() => {});
+      let detect = null;
+      if ('BarcodeDetector' in window) {
+        try {
+          const bd = new BarcodeDetector({ formats: ['qr_code'] });
+          detect = async () => (await bd.detect(video)).map((b) => b.rawValue);
+        } catch { detect = null; }
+      }
+      if (!detect) {
+        let jsQR;
+        try { jsQR = await loadJsQR(); } catch (err) { stop(); reject(err); return; }
+        const canvas = document.createElement('canvas');
+        const ctx = canvas.getContext('2d', { willReadFrequently: true });
+        detect = async () => {
+          const w = video.videoWidth;
+          const ht = video.videoHeight;
+          if (!w) return [];
+          const scale = Math.min(1, 1000 / Math.max(w, ht));
+          canvas.width = Math.round(w * scale);
+          canvas.height = Math.round(ht * scale);
+          ctx.drawImage(video, 0, 0, canvas.width, canvas.height);
+          const img = ctx.getImageData(0, 0, canvas.width, canvas.height);
+          const r = jsQR(img.data, img.width, img.height, { inversionAttempts: 'dontInvert' });
+          return r ? [r.data] : [];
+        };
+      }
+      status.textContent = 'Hold telefonen mod QR-koden på pc’en.';
+      const parts = new Map();
+      let sid = null;
+      let total = 0;
+      const tick = async () => {
+        if (stopped) return;
+        try {
+          for (const text of await detect()) {
+            const m = /^A104:([0-9A-Z]{4}):(\d+)\/(\d+)\/(\d+):([\s\S]*)$/.exec(text);
+            if (!m) {
+              if (/^https?:/i.test(text)) status.textContent = 'Det er koden til appen – scan den store kode, der skifter.';
+              continue;
+            }
+            if (sid !== m[1]) { sid = m[1]; parts.clear(); total = Number(m[3]); }
+            parts.set(Number(m[2]), m[5].padEnd(Number(m[4]), ' '));
+            fill.style.width = `${Math.round((parts.size / total) * 100)}%`;
+            status.textContent = `Modtaget ${parts.size} af ${total} koder…`;
+            if (parts.size === total) {
+              stop();
+              resolve(Array.from({ length: total }, (_, i) => parts.get(i + 1)).join(''));
+              return;
+            }
+          }
+        } catch { /* et enkelt billede, der ikke kunne læses */ }
+        setTimeout(tick, 50);
+      };
+      tick();
+    })();
+  });
+}
+
+/** Den komprimerede form fra QR-koden -> samme form som projektfilen (OneDrive\A104 Navigator\<projekt>.json). */
+async function snapshotFromQr(text) {
+  const data = JSON.parse(await inflate(fromBase45(text)));
+  const dirs = ['', ...data.d];
+  const base = (data.u || '').replace(/\/$/, '');
+  const urlFor = (path, file) => (base ? `${base}/${path.split('/').map(encodeURIComponent).join('/')}${file ? '?web=1' : ''}` : '');
+  const items = data.d.map((p) => ({ path: p, folder: true, url: urlFor(p, false) }));
+  for (const [dir, name, size, minutes, by] of data.f) {
+    const path = dirs[dir] ? `${dirs[dir]}/${name}` : name;
+    items.push({ path, folder: false, size, modified: new Date(minutes * 60000).toISOString(), url: urlFor(path, true), by: by || '' });
+  }
+  return { format: 'a104-projekt', project: { name: data.n, project_id: data.p, where: data.w, url: data.u }, created: data.c,
+    truncated: data.t, items };
+}
+
 class ProjectPage {
   constructor(root, params) {
     this.root = h('div', { class: 'page' });
@@ -1307,11 +1446,11 @@ class ProjectPage {
     this.init(params);
   }
 
-  async init() {
+  async init(params) {
     this.state = await store.get('projects', { list: [], current: '' });
     this.project = this.state.list.find((p) => p.id === this.state.current) || null;
-    if (this.project) return this.openProject();
-    this.showStart();
+    if (this.project) this.openProject(); else this.showStart();
+    if (params?.get('scan')) this.update(params);
   }
 
   /** Startside: åbn projektfilen fra Windows-programmet (virker altid) eller log ind med Microsoft (kræver IT). */
@@ -1320,12 +1459,18 @@ class ProjectPage {
     const recent = this.state.list.filter((p) => p.id !== this.project?.id);
     this.root.append(pageHead('Projekt', 'Se dit projekt fra OneDrive/Teams med A104-koder og tjek af filnavne – også på telefonen.'),
       h('div', { class: 'settings' },
-        h('div', { class: 'card' }, h('h2', {}, 'Åbn projekt fra OneDrive'),
+        h('div', { class: 'card' }, h('h2', {}, 'Overfør fra pc ', h('span', { class: 'beta' }, 'BETA')),
           note ? h('p', { class: 'warn-text' }, note) : null,
+          h('ol', { class: 'steps' },
+            h('li', {}, 'Åbn projektet i A104 Navigator på pc’en (Windows-programmet), og tryk ', h('b', {}, '📱 Mobil (beta)'), '.'),
+            h('li', {}, 'Tryk herunder, og hold telefonen mod QR-koden på pc’en, til der står ', h('i', {}, 'Gemt'), '.')),
+          h('button', { type: 'button', class: 'btn primary', onclick: () => this.scan() }, '📷 Scan fra pc'),
+          h('p', { class: 'muted' }, 'Kun mappe- og filnavne overføres – intet filindhold, intet login, intet internet.')),
+        h('div', { class: 'card' }, h('h2', {}, 'Åbn projekt fra OneDrive'),
           h('ol', { class: 'steps' },
             h('li', {}, 'Åbn projektet i A104 Navigator på pc’en (Windows-programmet). Det gemmer projektet i din OneDrive i mappen ', h('b', {}, 'A104 Navigator'), '.'),
             h('li', {}, 'Tryk herunder, vælg OneDrive, og vælg projektets fil (fx ', h('i', {}, 'BKN-MIL-F26-2H-G1.json'), ').')),
-          h('button', { type: 'button', class: 'btn primary', onclick: () => this.pickFile() }, '📂 Vælg projektfil'),
+          h('button', { type: 'button', class: 'btn', onclick: () => this.pickFile() }, '📂 Vælg projektfil'),
           h('p', { class: 'muted' }, 'Filen indeholder kun mappe- og filnavne – intet filindhold. Filerne åbnes i OneDrive/Teams med dit almindelige Microsoft-login.')),
         recent.length ? h('div', { class: 'card' }, h('h2', {}, 'Tidligere projekter'), h('div', { class: 'list' },
           recent.map((p) => row({ title: `📁 ${p.name}`, sub: p.where }, () => this.choose(p, false))))) : null,
@@ -1349,17 +1494,33 @@ class ProjectPage {
       toast('Det er ikke en A104-projektfil. Vælg filen i mappen »A104 Navigator« i din OneDrive.');
       return;
     }
+    await this.saveSnapshot(data, file.name.replace(/\.json$/i, ''));
+  }
+
+  async scan() {
+    try {
+      await this.saveSnapshot(await snapshotFromQr(await scanFrames()), 'Projekt');
+    } catch (err) {
+      if (!err.cancelled) toast(err.message);
+    }
+  }
+
+  async saveSnapshot(data, fallbackName) {
     const pr = data.project || {};
-    const name = pr.name || file.name.replace(/\.json$/i, '');
+    const name = pr.name || fallbackName;
     const p = { id: `file:${name}`, source: 'file', name, where: pr.where || '', url: pr.url || '', projectId: pr.project_id || '' };
     const items = data.items.map((i) => ({ id: i.path, name: i.path.split('/').pop(), path: i.path, folder: !!i.folder, size: i.size || 0,
       modified: i.modified || '', url: i.url || '', by: i.by || '' }));
     await store.set(`project-scan:${p.id}`, { at: data.created || new Date().toISOString(), truncated: !!data.truncated, items, file: true });
     await this.choose(p, false);
-    toast(`Åbnet: ${name}`);
+    toast(`Gemt på telefonen: ${name}`);
   }
 
-  update() { /* siden har ingen parametre */ }
+  update(params) {
+    if (!params.get('scan')) return;
+    navigate('project', {}, { replace: true }); // QR-koden til appen (#/project?scan=1) starter scanneren
+    this.scan();
+  }
 
   reset(fill = false) {
     this.root.className = `page${fill ? ' fill' : ''}`;
@@ -1462,7 +1623,7 @@ class ProjectPage {
     this.onlyIssues = h('input', { type: 'checkbox' });
     this.onlyIssues.addEventListener('change', () => this.showFolder(this.folder));
     this.refreshBtn = p.source === 'file'
-      ? h('button', { type: 'button', class: 'btn', onclick: () => this.pickFile(), title: 'Vælg den nyeste projektfil fra OneDrive' }, '📂 Opdatér fra fil')
+      ? h('button', { type: 'button', class: 'btn', onclick: () => this.scan(), title: 'Scan QR-koden fra »📱 Mobil (beta)« på pc’en igen' }, '📷 Opdatér (scan)')
       : h('button', { type: 'button', class: 'btn', onclick: () => this.load(true) }, '⟳ Opdater');
     const list = listPane();
     this.scroll = list.scroll;
