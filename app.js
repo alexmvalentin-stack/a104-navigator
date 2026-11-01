@@ -2,7 +2,7 @@
 // A104 Navigator – web-app (PWA). Brugerfladen er skrevet her; al logik (søgning, dokumentfinder, BR18, AB 18 …)
 // er A104 Navigators egen Python-kerne, der kører i worker.js med Pyodide.
 
-const BUILD = '2.19.0-6c5c358328';
+const BUILD = '2.19.0-ee73f71d1b';
 const VERSION = '2.19.0';
 
 // =========================================================================== hjælpere
@@ -1741,7 +1741,8 @@ class ProjectPage {
       h('div', { class: 'page-head' }, h('h1', {}, `📁 ${p.name}`), this.summary),
       h('div', { class: 'toolbar' }, this.filter, h('label', { class: 'check' }, this.onlyIssues, 'Kun filer med bemærkninger'),
         h('label', { class: 'check' }, this.onlyPending, '⏳ Mangler godkendelse'),
-        h('button', { type: 'button', class: 'btn primary', onclick: () => this.pickUpload() }, '📷 Foto / dokument'),
+        h('button', { type: 'button', class: 'btn primary', onclick: () => this.pickUpload(true),
+          title: 'Tag et foto eller vælg en fil – pc’en finder selv den rigtige mappe' }, '📥 Læg i mappe'),
         h('button', { type: 'button', class: 'btn', onclick: () => this.pickCheck(), title: 'Vælg filer fra OneDrive på telefonen og tjek navngivningen' }, '🔍 Tjek filer'),
         this.refreshBtn, h('button', { type: 'button', class: 'btn', onclick: () => this.showStart() }, 'Skift projekt')),
       this.split);
@@ -1894,11 +1895,38 @@ class ProjectPage {
     if (reveal) d.reveal();
   }
 
-  pickUpload() {
+  pickUpload(quick = false) {
     const input = h('input', { type: 'file', accept: 'image/*,application/pdf,.doc,.docx,.xls,.xlsx,.ppt,.pptx,.dwg,.ifc,.txt', hidden: true });
-    input.addEventListener('change', () => { if (input.files[0]) this.showUpload(input.files[0]); input.remove(); });
+    input.addEventListener('change', () => {
+      const file = input.files[0];
+      if (file) { if (quick && this.project.inbox) this.showQuickUpload(file); else this.showUpload(file); }
+      input.remove();
+    });
     document.body.append(input);
     input.click();
+  }
+
+  /** 📥 Læg i mappe: filen sendes, som den er, til projektets indbakke, og Windows-programmet finder selv mappen og
+   *  A104-navnet – ud fra navn, indhold, tekstgenkendelse og tegningshoved, ligesom »Placér korrekt«.
+   *  Navnet ændres ikke her: kameraets tal-navn får pc'en til at læse billedet i stedet for at gætte ud fra navnet. */
+  showQuickUpload(file) {
+    const d = this.detail;
+    const preview = file.type.startsWith('image/') ? h('img', { class: 'upload-preview', alt: '', src: URL.createObjectURL(file) }) : null;
+    d.doc.replaceChildren(
+      h('h1', {}, '📥 Læg i mappe'),
+      preview || '',
+      h('p', { class: 'muted break' }, `${file.name} · ${fmtSize(file.size)}`),
+      h('div', { class: 'toolbar', style: 'margin-top:12px' },
+        h('button', { type: 'button', class: 'btn primary', onclick: () => shareFile(file, this.project.inbox) }, '📥 Læg i mappe'),
+        h('button', { type: 'button', class: 'btn', onclick: () => this.showUpload(file) }, 'Vælg selv mappe og navn…')),
+      h('ol', { class: 'steps' },
+        h('li', {}, 'Tryk »Læg i mappe«, og vælg ', h('b', {}, 'OneDrive'), ' i delingsmenuen.'),
+        h('li', {}, 'Gem filen i: ', h('b', { class: 'break' }, this.project.inbox), ' – det er den samme mappe hver gang.'),
+        h('li', {}, 'A104 Navigator på pc’en finder selv den rigtige mappe og giver filen et A104-navn – ud fra indholdet, '
+          + 'tekstgenkendelse og tegningshoved, ligesom »Placér korrekt«. Den kommer i Loggen som ', h('i', {}, '⏳ Mangler godkendelse'), '.'),
+        h('li', { class: 'muted' }, 'Det sker, når programmet kører på pc’en med projektet åbent.')));
+    d.body.scrollTop = 0;
+    d.reveal();
   }
 
   /** En ny fil fra telefonen: find mappe og A104-navn, og send den videre med OneDrive-appen (Del). Appen må ikke
