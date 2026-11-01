@@ -110,6 +110,14 @@ input[type="text"], input[type="search"]:not(#global-search), select, input[type
   border: 1px solid var(--border); border-radius: 6px; padding: 8px 10px; background: var(--surface); min-height: 38px; }
 input:focus, select:focus { border-color: var(--accent); outline: none; }
 label.check { display: inline-flex; align-items: center; gap: 6px; cursor: pointer; }
+.ok-text, .row .r-code.ok-text { color: var(--success); }
+.warn-text, .row .r-code.warn-text { color: var(--warning); }
+.break { overflow-wrap: anywhere; }
+.steps { margin: 6px 0 12px; padding-left: 20px; }
+.steps li { margin: 4px 0; }
+.crumbs { display: flex; flex-wrap: wrap; gap: 2px; margin: 0 0 10px; }
+.crumbs .btn:disabled { opacity: 1; font-weight: 600; }
+.crumbs .btn + .btn::before { content: '›'; color: var(--muted); margin-right: 6px; }
 .muted { color: var(--muted); }
 .mono { font-family: var(--mono); }
 .code { font-family: var(--mono); color: var(--accent); font-weight: 600; }

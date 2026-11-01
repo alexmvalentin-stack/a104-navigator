@@ -2,7 +2,7 @@
 // A104 Navigator – web-app (PWA). Brugerfladen er skrevet her; al logik (søgning, dokumentfinder, BR18, AB 18 …)
 // er A104 Navigators egen Python-kerne, der kører i worker.js med Pyodide.
 
-const BUILD = '2.18.0-bc430c89ae';
+const BUILD = '2.18.0-13be29e9fc';
 const VERSION = '2.18.0';
 
 // =========================================================================== hjælpere
@@ -151,7 +151,7 @@ async function savePrefs() {
 
 // =========================================================================== navigation
 const NAV = [
-  ['dashboard', '🏠', 'Dashboard'], ['finder', '🔎', 'Dokumentfinder'], ['tree', '🗂', 'Mappestruktur'],
+  ['dashboard', '🏠', 'Dashboard'], ['project', '📂', 'Projekt'], ['finder', '🔎', 'Dokumentfinder'], ['tree', '🗂', 'Mappestruktur'],
   ['codes', '🏷', 'Koder'], ['learn', '📘', 'Lær A104'], ['label', 'REGLER OG AFTALER'],
   ['br18', '📗', 'BR18 2026'], ['law/ab18', '⚖', 'AB 18'], ['law/abr18', '⚖', 'ABR 18'], ['law/abt18', '⚖', 'ABT 18'],
   ['label', ''], ['favorites', '⭐', 'Favoritter'], ['settings', '⚙', 'Indstillinger'],
@@ -1267,6 +1267,393 @@ class LawPage {
   }
 }
 
+// =========================================================================== Projekt (OneDrive)
+// Projektmappen læses med Microsoft Graph (kun læseadgang). A104-koder og navngivning tjekkes af Python-kernen
+// (project_manager.py – den samme kode som i Windows-programmet). Seneste indlæsning gemmes, så den kan ses offline.
+const SCAN_LIMIT = 8000;
+const fmtDate = (iso) => (iso ? new Date(iso).toLocaleString('da-DK', { dateStyle: 'medium', timeStyle: 'short' }) : '');
+const fmtSize = (n) => (n >= 1e6 ? `${(n / 1e6).toFixed(1)} MB` : n >= 1e3 ? `${Math.round(n / 1e3)} kB` : `${n} B`);
+
+async function scanDrive(driveId, itemId, onProgress) {
+  const sel = '$select=id,name,folder,size,lastModifiedDateTime,webUrl,lastModifiedBy&$top=999';
+  const items = [];
+  let level = [{ id: itemId, path: '' }];
+  let read = 0;
+  while (level.length && items.length < SCAN_LIMIT) {
+    const next = [];
+    for (let i = 0; i < level.length; i += 6) {
+      const chunk = level.slice(i, i + 6);
+      const lists = await Promise.all(chunk.map((f) => MS.all(`/drives/${driveId}/items/${f.id}/children?${sel}`)));
+      lists.forEach((kids, j) => {
+        for (const k of kids) {
+          const path = chunk[j].path ? `${chunk[j].path}/${k.name}` : k.name;
+          items.push({ id: k.id, name: k.name, path, folder: !!k.folder, size: k.size || 0, modified: k.lastModifiedDateTime,
+            url: k.webUrl, by: k.lastModifiedBy?.user?.displayName || '' });
+          if (k.folder && k.folder.childCount !== 0) next.push({ id: k.id, path });
+        }
+      });
+      read += chunk.length;
+      onProgress(read, items.length);
+    }
+    level = next;
+  }
+  return { items, truncated: items.length >= SCAN_LIMIT };
+}
+
+class ProjectPage {
+  constructor(root, params) {
+    this.root = h('div', { class: 'page' });
+    root.append(this.root);
+    this.init(params);
+  }
+
+  async init() {
+    this.state = await store.get('projects', { list: [], current: '' });
+    this.project = this.state.list.find((p) => p.id === this.state.current) || null;
+    if (this.project) return this.openProject();
+    this.showStart();
+  }
+
+  /** Startside: åbn projektfilen fra Windows-programmet (virker altid) eller log ind med Microsoft (kræver IT). */
+  showStart(note) {
+    this.reset();
+    const recent = this.state.list.filter((p) => p.id !== this.project?.id);
+    this.root.append(pageHead('Projekt', 'Se dit projekt fra OneDrive/Teams med A104-koder og tjek af filnavne – også på telefonen.'),
+      h('div', { class: 'settings' },
+        h('div', { class: 'card' }, h('h2', {}, 'Åbn projekt fra OneDrive'),
+          note ? h('p', { class: 'warn-text' }, note) : null,
+          h('ol', { class: 'steps' },
+            h('li', {}, 'Åbn projektet i A104 Navigator på pc’en (Windows-programmet). Det gemmer projektet i din OneDrive i mappen ', h('b', {}, 'A104 Navigator'), '.'),
+            h('li', {}, 'Tryk herunder, vælg OneDrive, og vælg projektets fil (fx ', h('i', {}, 'BKN-MIL-F26-2H-G1.json'), ').')),
+          h('button', { type: 'button', class: 'btn primary', onclick: () => this.pickFile() }, '📂 Vælg projektfil'),
+          h('p', { class: 'muted' }, 'Filen indeholder kun mappe- og filnavne – intet filindhold. Filerne åbnes i OneDrive/Teams med dit almindelige Microsoft-login.')),
+        recent.length ? h('div', { class: 'card' }, h('h2', {}, 'Tidligere projekter'), h('div', { class: 'list' },
+          recent.map((p) => row({ title: `📁 ${p.name}`, sub: p.where }, () => this.choose(p, false))))) : null,
+        MS.configured ? h('div', { class: 'card' }, h('h2', {}, 'Direkte fra OneDrive'),
+          h('p', { class: 'muted' }, 'Log ind med din skolekonto og vælg mappen – altid opdateret.'),
+          h('button', { type: 'button', class: 'btn', onclick: () => (MS.signedIn ? this.showPicker() : this.showLogin()) },
+            MS.signedIn ? 'Vælg mappe i OneDrive' : 'Log ind med Microsoft')) : null));
+  }
+
+  pickFile() {
+    const input = h('input', { type: 'file', accept: '.json,application/json', hidden: true });
+    input.addEventListener('change', () => { if (input.files[0]) this.importFile(input.files[0]); input.remove(); });
+    document.body.append(input);
+    input.click();
+  }
+
+  async importFile(file) {
+    let data;
+    try { data = JSON.parse(await file.text()); } catch { data = null; }
+    if (!data || data.format !== 'a104-projekt' || !Array.isArray(data.items)) {
+      toast('Det er ikke en A104-projektfil. Vælg filen i mappen »A104 Navigator« i din OneDrive.');
+      return;
+    }
+    const pr = data.project || {};
+    const name = pr.name || file.name.replace(/\.json$/i, '');
+    const p = { id: `file:${name}`, source: 'file', name, where: pr.where || '', url: pr.url || '', projectId: pr.project_id || '' };
+    const items = data.items.map((i) => ({ id: i.path, name: i.path.split('/').pop(), path: i.path, folder: !!i.folder, size: i.size || 0,
+      modified: i.modified || '', url: i.url || '', by: i.by || '' }));
+    await store.set(`project-scan:${p.id}`, { at: data.created || new Date().toISOString(), truncated: !!data.truncated, items, file: true });
+    await this.choose(p, false);
+    toast(`Åbnet: ${name}`);
+  }
+
+  update() { /* siden har ingen parametre */ }
+
+  reset(fill = false) {
+    this.root.className = `page${fill ? ' fill' : ''}`;
+    this.root.replaceChildren();
+  }
+
+  showMessage(text) {
+    this.reset();
+    this.root.append(pageHead('Projekt'), h('div', { class: 'card' }, h('p', {}, text)));
+  }
+
+  failed(err, retry) {
+    if (err.code === 'login_required') return this.showLogin(err.message);
+    if (err.status === 403) return this.showStart('Microsoft-login er ikke godkendt af din skole endnu – åbn projektfilen i stedet.');
+    toast(err.message);
+    if (retry) retry();
+  }
+
+  showLogin(note) {
+    this.reset();
+    this.root.append(pageHead('Projekt', 'Se dit projekt fra OneDrive med A104-koder og tjek af filnavne – også på telefonen.'),
+      h('div', { class: 'settings' },
+        h('div', { class: 'card' }, h('h2', {}, 'Log ind med Microsoft'),
+          note ? h('p', { class: 'warn-text' }, note) : null,
+          h('p', { class: 'muted' }, 'Brug din skole- eller arbejdskonto. Appen kan kun læse filerne i din egen OneDrive; den ændrer intet. '
+            + 'Login gemmes i browseren på denne enhed.'),
+          h('button', { type: 'button', class: 'btn primary', onclick: () => MS.login('#/project') }, 'Log ind med Microsoft'),
+          ' ', h('button', { type: 'button', class: 'btn', onclick: () => this.showStart() }, 'Åbn projektfil i stedet'))));
+  }
+
+  saveState() { return store.set('projects', this.state); }
+
+  // ------------------------------------------------------------- vælg projektmappe
+  async showPicker() {
+    this.reset();
+    this.root.append(pageHead('Vælg projektmappe'), h('p', { class: 'empty' }, 'Henter din OneDrive…'));
+    try {
+      const d = await MS.get('/me/drive/root?$select=id,webUrl,parentReference');
+      this.browse({ driveId: d.parentReference.driveId, itemId: d.id, name: 'OneDrive', url: d.webUrl }, []);
+    } catch (err) {
+      if (err.code === 'login_required') return this.showLogin(err.message);
+      this.showMessage(`Kunne ikke åbne din OneDrive: ${err.message}`);
+    }
+  }
+
+  /** Mappebrowser: vis undermapperne og lad brugeren vælge den mappe, der er projektet. */
+  async browse(folder, crumbs) {
+    this.reset();
+    const list = h('div', { class: 'list' }, h('p', { class: 'muted' }, 'Henter mapper…'));
+    const trail = [...crumbs, folder];
+    const nav = h('div', { class: 'crumbs' }, trail.map((c, i) => h('button', { type: 'button', class: 'btn flat',
+      disabled: i === trail.length - 1 ? 'disabled' : null, onclick: () => this.browse(c, trail.slice(0, i)) }, i ? c.name : '☁ OneDrive')));
+    const acc = MS.account || {};
+    const recent = this.state.list.filter((p) => p.id !== this.project?.id);
+    this.root.append(pageHead('Vælg projektmappe', 'Gå ned til den mappe, der er dit projekt (fx den med C01, C02 …), og tryk »Vælg«.'),
+      nav,
+      crumbs.length ? h('div', { class: 'toolbar' }, h('button', { type: 'button', class: 'btn primary', onclick: () => this.choose({
+        id: `${folder.driveId}!${folder.itemId}`, driveId: folder.driveId, itemId: folder.itemId, name: folder.name, url: folder.url,
+        where: trail.slice(0, -1).map((c, i) => (i ? c.name : 'OneDrive')).join(' › ') }) }, `✓ Vælg »${folder.name}«`)) : null,
+      h('div', { class: 'settings' },
+        h('div', { class: 'card' }, list),
+        recent.length ? h('div', { class: 'card' }, h('h2', {}, 'Tidligere projekter'), h('div', { class: 'list' },
+          recent.map((p) => row({ title: `📁 ${p.name}`, sub: p.where }, () => this.choose(p))))) : null,
+        h('div', { class: 'card' }, h('h2', {}, 'Konto'),
+          h('p', { class: 'muted' }, `Logget ind som ${acc.name || ''} ${acc.user ? `(${acc.user})` : ''}`),
+          h('button', { type: 'button', class: 'btn', onclick: () => this.logout() }, 'Log ud'))));
+    try {
+      const kids = await MS.all(`/drives/${folder.driveId}/items/${folder.itemId}/children?$select=id,name,folder,webUrl&$top=999`);
+      const subs = kids.filter((k) => k.folder).sort((a, b) => a.name.localeCompare(b.name, 'da', { numeric: true }));
+      const files = kids.length - subs.length;
+      list.replaceChildren(...subs.map((k) => row({ title: `📁 ${k.name}`, score: k.folder.childCount ? String(k.folder.childCount) : '' },
+        () => this.browse({ driveId: folder.driveId, itemId: k.id, name: k.name, url: k.webUrl }, trail))),
+      files ? h('p', { class: 'muted' }, `${files} filer i mappen`) : null,
+      !kids.length ? h('p', { class: 'muted' }, 'Mappen er tom.') : null);
+    } catch (err) { this.failed(err); }
+  }
+
+  async choose(p, refresh = true) {
+    this.state.list = [p, ...this.state.list.filter((x) => x.id !== p.id)].slice(0, 8);
+    this.state.current = p.id;
+    await this.saveState();
+    this.project = p;
+    this.scan = null;
+    this.openProject(refresh && p.source !== 'file');
+  }
+
+  async logout() {
+    MS.logout();
+    toast('Logget ud');
+    this.showStart();
+  }
+
+  // --------------------------------------------------------------------- projektet
+  async openProject(refresh = false) {
+    const p = this.project;
+    this.reset(true);
+    this.summary = h('p', {}, '');
+    this.filter = h('input', { type: 'search', placeholder: 'Søg efter fil – fx referat eller C05', 'aria-label': 'Søg i projektet' });
+    this.filter.addEventListener('input', debounce(() => this.showFolder(this.folder), 150));
+    this.onlyIssues = h('input', { type: 'checkbox' });
+    this.onlyIssues.addEventListener('change', () => this.showFolder(this.folder));
+    this.refreshBtn = p.source === 'file'
+      ? h('button', { type: 'button', class: 'btn', onclick: () => this.pickFile(), title: 'Vælg den nyeste projektfil fra OneDrive' }, '📂 Opdatér fra fil')
+      : h('button', { type: 'button', class: 'btn', onclick: () => this.load(true) }, '⟳ Opdater');
+    const list = listPane();
+    this.scroll = list.scroll;
+    this.detail = new Pane({ empty: 'Vælg en mappe.' });
+    this.detail.tool('Åbn i OneDrive', () => {
+      const url = this.folderUrl();
+      if (url) window.open(url, '_blank', 'noopener'); else toast('Projektet ligger kun på pc’en – det er ikke i OneDrive/Teams.');
+    }, 'Åbn mappen i OneDrive/Teams');
+    this.split = h('div', { class: 'split' }, list.el, this.detail.el);
+    this.root.append(
+      h('div', { class: 'page-head' }, h('h1', {}, `📁 ${p.name}`), this.summary),
+      h('div', { class: 'toolbar' }, this.filter, h('label', { class: 'check' }, this.onlyIssues, 'Kun filer med bemærkninger'),
+        this.refreshBtn, h('button', { type: 'button', class: 'btn', onclick: () => this.showStart() }, 'Skift projekt')),
+      this.split);
+    this.scroll.append(h('p', { class: 'empty' }, 'Henter projektet…'));
+    const cached = refresh ? null : await store.get(`project-scan:${p.id}`, null);
+    if (cached) { this.apply(cached); if (p.source !== 'file' && navigator.onLine && MS.signedIn) this.load(false); } else if (p.source === 'file') this.showStart('Projektfilen er ikke gemt på denne enhed – vælg den igen.'); else this.load(true);
+  }
+
+  async load(visible) {
+    const p = this.project;
+    if (!MS.signedIn) { if (!this.scan) this.showLogin('Log ind for at hente projektet.'); else toast('Log ind for at opdatere projektet.'); return; }
+    this.refreshBtn.disabled = true;
+    const old = this.refreshBtn.textContent;
+    try {
+      const res = await scanDrive(p.driveId, p.itemId, (folders, files) => {
+        this.refreshBtn.textContent = `Læser… ${folders} mapper`;
+        if (visible && !this.scan) this.scroll.replaceChildren(h('p', { class: 'empty' }, `Læser projektet… ${folders} mapper, ${files} elementer`));
+      });
+      const scan = { at: new Date().toISOString(), truncated: res.truncated, items: res.items };
+      await store.set(`project-scan:${p.id}`, scan);
+      if (this.project === p && this.root.isConnected) this.apply(scan);
+    } catch (err) {
+      if (err.code === 'login_required' && !this.scan) return this.showLogin(err.message);
+      toast(`Kunne ikke hente projektet: ${err.message}`);
+      if (!this.scan) this.scroll.replaceChildren(h('p', { class: 'empty' }, err.message));
+    } finally {
+      this.refreshBtn.disabled = false;
+      this.refreshBtn.textContent = old;
+    }
+  }
+
+  async apply(scan) {
+    const status = await api('project_scan', scan.items.map((i) => [i.id, i.path, i.folder, i.size, i.modified]));
+    this.scan = scan;
+    this.status = status;
+    const s = status.summary;
+    const when = fmtDate(scan.at);
+    this.summary.innerHTML = `${esc(this.project.where || '')}${this.project.where ? ' · ' : ''}<b>${s.files}</b> filer i ${s.folders} mapper · `
+      + `<span class="ok-text">✓ ${s.ok} følger A104</span> · <span class="warn-text">⚠ ${s.issues} med bemærkninger</span>`
+      + `<br><span class="muted">${scan.file ? 'Gemt fra Windows-programmet' : 'Hentet'} ${esc(when)}${scan.truncated ? ` · kun de første ${SCAN_LIMIT} elementer` : ''}</span>`;
+    this.buildTree();
+    const keep = this.folder != null && (this.folder === '' || status.folders[this.folder]) ? this.folder : '';
+    this.showFolder(keep, { reveal: false });
+  }
+
+  buildTree() {
+    const items = this.scan.items;
+    this.files = items.filter((i) => !i.folder && this.status.files[i.id]);
+    this.byParent = new Map();
+    for (const f of this.files) {
+      const parent = f.path.includes('/') ? f.path.slice(0, f.path.lastIndexOf('/')) : '';
+      if (!this.byParent.has(parent)) this.byParent.set(parent, []);
+      this.byParent.get(parent).push(f);
+    }
+    const folders = items.filter((i) => i.folder && this.status.folders[i.path]);
+    this.folderItems = new Map(folders.map((f) => [f.path, f]));
+    const kids = new Map();
+    for (const f of folders) {
+      const parent = f.path.includes('/') ? f.path.slice(0, f.path.lastIndexOf('/')) : '';
+      if (!kids.has(parent)) kids.set(parent, []);
+      kids.get(parent).push(f);
+    }
+    const sortName = (a, b) => a.name.localeCompare(b.name, 'da', { numeric: true });
+    const counts = (path) => {
+      const own = this.byParent.get(path) || [];
+      let n = own.length;
+      let bad = own.filter((f) => !this.status.files[f.id][0]).length;
+      for (const k of kids.get(path) || []) { const c = counts(k.path); n += c[0]; bad += c[1]; }
+      return [n, bad];
+    };
+    this.rows = new Map();
+    const make = (f, depth) => {
+      const st = f ? this.status.folders[f.path] : null;
+      const path = f ? f.path : '';
+      const sub = (kids.get(path) || []).sort(sortName);
+      const [n, bad] = counts(path);
+      const li = h('li', { class: `${depth === 0 ? 'top ' : ''}${sub.length && depth >= 1 ? 'collapsed' : ''}` });
+      const tw = h('button', { type: 'button', class: `tw${sub.length ? '' : ' leaf'}`, 'aria-label': 'Fold ud/sammen',
+        onclick: () => { li.classList.toggle('collapsed'); tw.textContent = li.classList.contains('collapsed') ? '▸' : '▾'; } },
+      li.classList.contains('collapsed') ? '▸' : '▾');
+      const name = f ? f.name.replace(/^([CDP]\d{1,2}(?:\.[A-Z]?\d{1,2})?)\s+/i, '') : this.project.name;
+      const r = row({ code: st?.own ? st.code : '', title: f ? `📁 ${name}` : `📂 ${name}`, score: n ? `${bad ? '⚠ ' : ''}${n}` : '' }, () => this.showFolder(path));
+      r.title = st?.code ? `${st.code} ${st.a104}${bad ? ` – ${bad} filer med bemærkninger` : ''}` : (f ? 'Ikke en A104-mappe' : 'Projektmappen');
+      li.append(h('div', { class: 'node' }, tw, r));
+      if (sub.length) li.append(h('ul', {}, sub.map((k) => make(k, depth + 1))));
+      this.rows.set(path, { li, row: r });
+      return li;
+    };
+    this.tree = h('ul', { class: 'tree list' }, make(null, 0));
+    this.scroll.replaceChildren(this.tree);
+  }
+
+  folderUrl() {
+    if (this.folder && this.folderItems?.get(this.folder)) return this.folderItems.get(this.folder).url;
+    return this.project.url;
+  }
+
+  fileRow(f, showPath) {
+    const [ok, message] = this.status.files[f.id];
+    const parent = f.path.includes('/') ? f.path.slice(0, f.path.lastIndexOf('/')) : '';
+    const sub = [showPath ? (parent || this.project.name) : '', ok ? '' : message, fmtDate(f.modified) + (f.by ? ` · ${f.by}` : '')].filter(Boolean).join(' · ');
+    const r = row({ code: ok ? '✓' : '⚠', title: f.name, sub }, () => this.showFile(f));
+    r.querySelector('.r-code').classList.add(ok ? 'ok-text' : 'warn-text');
+    return r;
+  }
+
+  showFolder(path, { reveal = true } = {}) {
+    if (!this.scan) return;
+    this.folder = path ?? '';
+    const text = this.filter.value.trim().toLowerCase();
+    const issues = this.onlyIssues.checked;
+    const d = this.detail;
+    d.doc.replaceChildren();
+    d.body.scrollTop = 0;
+    if (text || issues) {
+      const key = codeKey(text);
+      const hits = this.files.filter((f) => (!issues || !this.status.files[f.id][0])
+        && (!text || f.path.toLowerCase().includes(text) || (key && codeKey(f.name).startsWith(key))));
+      d.doc.append(h('h1', {}, text ? `Filer med »${this.filter.value.trim()}«` : 'Filer med bemærkninger'),
+        h('p', { class: 'muted' }, `${hits.length} filer i hele projektet${hits.length > 300 ? ' – de første 300 vises' : ''}`),
+        h('div', { class: 'list' }, hits.slice(0, 300).map((f) => this.fileRow(f, true))));
+      select(this.tree, null);
+      if (reveal && isNarrow()) d.reveal();
+      return;
+    }
+    const st = this.status.folders[this.folder];
+    const item = this.rows.get(this.folder);
+    if (item) {
+      let li = item.li.parentElement?.closest('li');
+      while (li) { li.classList.remove('collapsed'); li.querySelector(':scope > .node .tw').textContent = '▾'; li = li.parentElement?.closest('li'); }
+      select(this.tree, item.row);
+      scrollWithin(item.row, 'nearest');
+    }
+    const files = (this.byParent.get(this.folder) || []).slice().sort((a, b) => a.name.localeCompare(b.name, 'da', { numeric: true }));
+    const name = this.folder ? this.folder.split('/').pop() : this.project.name;
+    d.doc.append(h('p', { class: 'muted' }, this.folder ? `${this.project.name} › ${this.folder.split('/').join(' › ')}` : this.project.where || ''),
+      h('h1', {}, name));
+    if (st?.code) {
+      d.doc.append(h('p', {}, st.own ? 'A104-mappe ' : 'Ligger i A104-mappen ',
+        h('a', { href: `tree:${st.code}` }, `${st.code} ${st.a104}`)));
+    } else if (this.folder) {
+      d.doc.append(h('p', { class: 'warn-text' }, 'Ikke en A104-mappe – filerne ligger uden for A104-strukturen.'));
+    }
+    d.doc.append(files.length ? h('div', { class: 'list' }, files.map((f) => this.fileRow(f, false)))
+      : h('p', { class: 'muted' }, 'Ingen filer direkte i mappen.'));
+    if (reveal) d.reveal();
+  }
+
+  async showFile(f) {
+    const d = this.detail;
+    const [ok, message, code] = this.status.files[f.id];
+    const parent = f.path.includes('/') ? f.path.slice(0, f.path.lastIndexOf('/')) : '';
+    const suggestion = h('div', {}, h('p', { class: 'muted' }, 'Finder forslag…'));
+    d.doc.replaceChildren(
+      h('p', {}, h('a', { href: '#', onclick: (e) => { e.preventDefault(); this.showFolder(parent, { reveal: false }); } }, `‹ ${parent ? parent.split('/').pop() : this.project.name}`)),
+      h('h1', { class: 'break' }, f.name),
+      h('p', { class: ok ? 'ok-text' : 'warn-text' }, `${ok ? '✓' : '⚠'} ${message}`),
+      h('p', { class: 'muted' }, [`Ændret ${fmtDate(f.modified)}`, f.by ? `af ${f.by}` : '', fmtSize(f.size)].filter(Boolean).join(' · ')),
+      h('div', { class: 'toolbar' }, f.url ? h('a', { class: 'btn primary', href: f.url, target: '_blank', rel: 'noopener' }, 'Åbn fil')
+        : h('span', { class: 'muted' }, 'Filen ligger kun på pc’en – den er ikke i OneDrive/Teams.')),
+      suggestion);
+    d.body.scrollTop = 0;
+    d.reveal();
+    try {
+      const s = await api('project_file', f.name, code || '', this.project.projectId || prefs.projectId || '');
+      if (!s.code) { suggestion.replaceChildren(h('p', { class: 'muted' }, s.reason || '')); return; }
+      const same = s.name === f.name && s.code === code;
+      suggestion.replaceChildren(h('div', { class: 'card' },
+        h('h2', {}, same ? 'A104' : 'Forslag'),
+        h('p', {}, 'Mappe: ', h('a', { href: `tree:${s.code}` }, `${s.code} ${s.folder}`), s.probability < 100 ? h('span', { class: 'muted' }, ` (${s.probability} %)`) : null),
+        s.path ? h('p', { class: 'muted' }, s.path) : null,
+        same ? null : h('p', {}, 'Filnavn: ', h('code', { class: 'break' }, s.name), ' ',
+          h('button', { type: 'button', class: 'btn flat', onclick: () => copyText(s.name) }, '⧉ Kopiér')),
+        h('p', { class: 'muted' }, s.reason)));
+    } catch (err) {
+      suggestion.replaceChildren(h('p', { class: 'muted' }, `Intet forslag: ${err.message}`));
+    }
+  }
+}
+
 // =========================================================================== Favoritter
 class FavoritesPage {
   constructor(root) {
@@ -1357,8 +1744,8 @@ class SettingsPage {
 
     wrap.append(h('div', { class: 'card' }, h('h2', {}, 'Om A104 Navigator'),
       h('div', { html: `Version ${esc(VERSION)} (web) · build <span class="mono">${esc(BUILD)}</span><br>${esc(meta.copyright || '')}<br>`
-        + '<span class="muted">Al søgning og analyse sker på din enhed – intet sendes nogen steder hen. Projekter (filhåndtering, Teams/SharePoint) '
-        + 'findes i Windows-programmet.</span>' }),
+        + '<span class="muted">Al søgning og analyse sker på din enhed. Under Projekt læser appen dine mapper i OneDrive direkte hos Microsoft '
+        + '(kun læseadgang). Filhåndtering (lægge filer ind, omdøbe) findes i Windows-programmet.</span>' }),
       h('div', { style: 'margin-top:12px' }, h('button', { type: 'button', class: 'btn', onclick: async () => {
         if (!confirm('Slet favoritter og indstillinger på denne enhed?')) return;
         await store.clear();
@@ -1380,6 +1767,7 @@ async function offlineStatus() {
 
 const PAGES = {
   dashboard: (v) => new Dashboard(v),
+  project: (v, p) => new ProjectPage(v, p),
   search: (v, p) => new SearchPage(v, p),
   finder: (v, p) => new FinderPage(v, p),
   tree: (v, p) => new TreePage(v, p),
@@ -1464,6 +1852,7 @@ async function start() {
   wireTopbar();
   $('#version').textContent = `Version ${VERSION} · web · offline`;
   registerServiceWorker();
+  const signIn = MS.configured ? MS.handleRedirect() : Promise.resolve(null);
   try {
     const favorites = await store.get('favorites', []);
     meta = await api('init', favorites);
@@ -1471,6 +1860,9 @@ async function start() {
     fail(`A104 Navigator kunne ikke starte: ${err.message}`);
     return;
   }
+  const signedIn = await signIn;
+  if (signedIn?.error) toast(`Login mislykkedes: ${signedIn.error}`);
+  else if (signedIn?.ok) toast(`Logget ind som ${MS.account?.name || ''}`);
   $('#splash').hidden = true;
   $('#app').hidden = false;
   render();
