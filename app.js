@@ -2,7 +2,7 @@
 // A104 Navigator – web-app (PWA). Brugerfladen er skrevet her; al logik (søgning, dokumentfinder, BR18, AB 18 …)
 // er A104 Navigators egen Python-kerne, der kører i worker.js med Pyodide.
 
-const BUILD = '2.19.0-aa89be9b09';
+const BUILD = '2.19.0-bd04cc9195';
 const VERSION = '2.19.0';
 
 // =========================================================================== hjælpere
@@ -1517,6 +1517,22 @@ async function sendToPc(file, project, progress) {
   return file;
 }
 
+/** Navnet, telefonen giver en fil, før mappe og A104-navn findes: kameraets og skærmbilledets tal-navne
+ *  (IMG_20261101_142800, 1793552404531, Screenshot_…) siger intet om indholdet og erstattes af »Foto <dato tid>«. */
+function phoneName(file) {
+  const dot = file.name.lastIndexOf('.');
+  const stem = dot > 0 ? file.name.slice(0, dot) : file.name;
+  const ext = dot > 0 ? file.name.slice(dot) : (file.type === 'image/jpeg' ? '.jpg' : '');
+  const d = new Date(file.lastModified || Date.now());
+  const pad = (n) => String(n).padStart(2, '0');
+  const stamp = `${d.getFullYear()}-${pad(d.getMonth() + 1)}-${pad(d.getDate())} ${pad(d.getHours())}.${pad(d.getMinutes())}`;
+  if (/^(screenshot|skærmbillede)/i.test(stem)) return `Skærmbillede ${stamp}${ext}`;
+  if (GENERIC_NAME_RE.test(stem) || /^[\d\s_-]+$/.test(stem) || /^(img|pxl|dsc|vid)[_-]?\d/i.test(stem)) {
+    return `${file.type.startsWith('image/') ? 'Foto' : 'Dokument'} ${stamp}${ext}`;
+  }
+  return file.name;
+}
+
 /** Mangler filen godkendelse? (»Mangler godkendelse« / »Ændret – mangler godkendelse« fra Windows-programmet) */
 const pendingApproval = (f) => /mangler godkendelse/i.test(f.approval || '');
 
@@ -1943,7 +1959,8 @@ class ProjectPage {
     input.addEventListener('change', () => {
       const file = input.files[0];
       if (file) {
-        if (quick && this.project.relay) this.sendQuick(file);
+        if (quick && this.canSaveDirect()) this.saveQuick(file);
+        else if (quick && this.project.relay) this.sendQuick(file);
         else if (quick && this.project.inbox) this.showQuickUpload(file);
         else this.showUpload(file);
       }
@@ -1951,6 +1968,98 @@ class ProjectPage {
     });
     document.body.append(input);
     input.click();
+  }
+
+  // ------------------------------------------------ gem direkte i OneDrive/Teams (Microsoft-login)
+  canSaveDirect() {
+    return MS.configured && MS.signedIn && !!(this.project.driveId || this.project.url);
+  }
+
+  /** Projektmappen i OneDrive/Teams ({driveId, id}). Projekter fra pc'en (QR) kender kun adressen – den slås op én gang. */
+  async driveRoot() {
+    const p = this.project;
+    if (p.driveId && p.itemId) return { driveId: p.driveId, id: p.itemId };
+    if (!p.drive) {
+      if (!p.url) throw new Error('Projektet har ingen adresse i OneDrive/Teams – det ligger kun på pc’en.');
+      p.drive = await MS.resolve(p.url);
+      await this.saveState();
+    }
+    return p.drive;
+  }
+
+  /** Den A104-mappe i projektet, der har koden (som den hedder i projektet), eller undefined. */
+  folderFor(code) {
+    return [...(this.folderItems?.values() || [])].find((f) => this.status.folders[f.path]?.code === code && this.status.folders[f.path].own);
+  }
+
+  /** Gem filen i projektets mappe. Uden `pick` findes mappe og A104-navn her på telefonen med Windows-programmets regler
+   *  (project_file); mangler mappen i projektet, oprettes den efter A104-strukturen. Returnerer {code, folder, name, folderPath, webUrl}. */
+  async saveDirect(file, pick, progress) {
+    const root = await this.driveRoot();
+    if (!pick) {
+      const s = await api('project_file', phoneName(file), null, this.project.projectId || prefs.projectId || '');
+      if (!s.code) throw new Error(s.reason || s.error || 'Kunne ikke finde en A104-mappe til filen.');
+      const own = this.folderFor(s.code);
+      pick = { code: s.code, folder: s.folder, name: s.name, folderPath: own ? own.path : (s.path || s.code).split(' → ').join('/') };
+    }
+    const item = await MS.upload(root.driveId, root.id, `${pick.folderPath}/${pick.name}`, file, progress);
+    await this.addUploaded(pick.folderPath, item || { name: pick.name });
+    return { ...pick, name: item?.name || pick.name, webUrl: item?.webUrl || '' };
+  }
+
+  /** Vis den nye fil i projektet med det samme – som »⏳ Mangler godkendelse«, til en på holdet godkender den. */
+  async addUploaded(folderPath, item) {
+    const key = `project-scan:${this.project.id}`;
+    const scan = (await store.get(key)) || this.scan;
+    if (!scan) return;
+    const have = new Set(scan.items.map((i) => i.path));
+    const parts = folderPath.split('/');
+    for (let i = 1; i <= parts.length; i++) {
+      const path = parts.slice(0, i).join('/');
+      if (!have.has(path)) { scan.items.push({ id: path, name: parts[i - 1], path, folder: true, size: 0, modified: '', url: '' }); have.add(path); }
+    }
+    const path = `${folderPath}/${item.name}`;
+    scan.items.push({ id: item.id || path, name: item.name, path, folder: false, size: item.size || 0,
+      modified: item.lastModifiedDateTime || new Date().toISOString(), url: item.webUrl || '', by: MS.account?.name || '',
+      approval: 'Mangler godkendelse' });
+    await store.set(key, scan);
+    await this.apply(scan);
+  }
+
+  /** 📥 Læg i mappe med Microsoft-login: find mappen og gem filen direkte. Går det galt, sendes den til pc'en i stedet. */
+  async saveQuick(file) {
+    const d = this.detail;
+    const preview = file.type.startsWith('image/') ? h('img', { class: 'upload-preview', alt: '', src: URL.createObjectURL(file) }) : '';
+    const status = h('p', { class: 'muted' }, 'Finder mappen og gemmer …');
+    const actions = h('div', { class: 'toolbar', style: 'margin-top:12px' });
+    const show = (...extra) => {
+      d.doc.replaceChildren(h('h1', {}, '📥 Læg i mappe'), preview, h('p', { class: 'muted break' }, `${file.name} · ${fmtSize(file.size)}`),
+        status, ...extra, actions);
+      d.body.scrollTop = 0;
+      d.reveal();
+    };
+    show();
+    try {
+      const r = await this.saveDirect(file, null, (done, total) => { status.textContent = `Gemmer … ${Math.round(100 * done / total)} %`; });
+      status.className = 'ok-text';
+      status.textContent = `✓ Gemt i ${r.code} ${r.folder}`;
+      actions.replaceChildren(h('button', { type: 'button', class: 'btn primary', onclick: () => this.pickUpload(true) }, '📥 Læg en til i mappe'),
+        r.webUrl ? h('button', { type: 'button', class: 'btn', onclick: () => openExternal(r.webUrl) }, 'Åbn fil') : '');
+      show(h('p', { class: 'break' }, h('b', {}, r.name)), h('p', { class: 'muted break' }, `${this.project.name} › ${r.folderPath.split('/').join(' › ')}`),
+        h('p', { class: 'muted' }, 'Står som ⏳ Mangler godkendelse, til en på holdet godkender den.'));
+    } catch (err) {
+      if (this.project.relay && err.code !== 'login_required') {
+        toast(`Kunne ikke gemme direkte: ${err.message} – sender til pc’en i stedet`);
+        this.sendQuick(file);
+        return;
+      }
+      status.className = 'warn-text';
+      status.textContent = `⚠ ${err.message === 'Failed to fetch' ? 'Ingen forbindelse – tjek internettet.' : err.message}`;
+      actions.replaceChildren(err.code === 'login_required'
+        ? h('button', { type: 'button', class: 'btn primary', onclick: () => MS.login('#/project') }, 'Log ind med Microsoft')
+        : h('button', { type: 'button', class: 'btn primary', onclick: () => this.saveQuick(file) }, 'Prøv igen'),
+      h('button', { type: 'button', class: 'btn', onclick: () => this.showUpload(file) }, 'Vælg selv mappe og navn…'));
+    }
   }
 
   /** 📥 Læg i mappe: send filen direkte til pc'en (ntfy.sh) – den finder selv mappe, kode og navn. */
@@ -1970,6 +2079,11 @@ class ProjectPage {
         + 'og skriver den i Loggen som ⏳ Mangler godkendelse.';
       actions.replaceChildren(h('button', { type: 'button', class: 'btn primary', onclick: () => this.pickUpload(true) }, '📥 Læg en til i mappe'));
       d.doc.append(h('p', { class: 'muted' }, 'Pc’en henter filen, når programmet kører – inden for 3 timer.'));
+      if (MS.configured && !MS.signedIn && this.project.url) {
+        d.doc.append(h('div', { class: 'card', style: 'margin-top:12px' },
+          h('p', {}, 'Log ind med Microsoft, så gemmes filerne direkte i projektets mapper i Teams/OneDrive – uden pc’en.'),
+          h('button', { type: 'button', class: 'btn', onclick: () => MS.login('#/project') }, 'Log ind med Microsoft')));
+      }
     } catch (err) {
       status.className = 'warn-text';
       status.textContent = `⚠ ${err.message === 'Failed to fetch' ? 'Ingen forbindelse – tjek internettet.' : err.message}`;
@@ -2053,6 +2167,15 @@ class ProjectPage {
       let finalName = (name.value.trim() || file.name).replace(/[\\/:*?"<>|]+/g, ' ');
       if (inbox && codeOf() && !finalName.toUpperCase().startsWith(`${codeOf()}_`.toUpperCase())) finalName = withCode(finalName);
       const out = new File([file], finalName.endsWith(ext) || !ext ? finalName : finalName + ext, { type: file.type });
+      if (this.canSaveDirect()) {
+        try {
+          const r = await this.saveDirect(out, { code: codeOf(), folder: this.status.folders[folderSel.value]?.a104 || '', name: out.name,
+            folderPath: folderSel.value });
+          toast(`✓ Gemt i ${r.code} ${r.folder}: ${r.name}`);
+          this.showFolder(folderSel.value);
+          return;
+        } catch (err) { toast(`Kunne ikke gemme direkte: ${err.message}`); }
+      }
       if (this.project.relay) {
         try { await sendToPc(out, this.project); toast(`✓ Sendt til pc’en – lægges i ${codeOf() || 'projektet'}`); return; }
         catch (err) { toast(`${err.message} – deler i stedet`); }

@@ -1,12 +1,14 @@
 'use strict';
-// Microsoft-login (OAuth 2.0 med PKCE) og Microsoft Graph – så web-appen kan vise projekter i din OneDrive
-// (skole/arbejde). Kun læseadgang til dine egne filer. Login-oplysningerne (tokens) gemmes i browseren på denne enhed og sendes kun til Microsoft.
+// Microsoft-login (OAuth 2.0 med PKCE) og Microsoft Graph – så web-appen kan vise projekter i OneDrive/Teams og
+// gemme fotos og dokumenter direkte i projektets A104-mapper (»📥 Læg i mappe«). Appen er registreret til alle
+// organisationer og private Microsoft-konti (tenant »common«); en organisation, der ikke lader brugerne godkende apps
+// selv, skal godkende den én gang. Login-oplysningerne (tokens) gemmes i browseren på denne enhed og sendes kun til Microsoft.
 
 const MS = (() => {
   const CLIENT_ID = '';
-  const TENANT = 'organizations';
+  const TENANT = 'common';
   const AUTHORITY = `https://login.microsoftonline.com/${TENANT}/oauth2/v2.0`;
-  const SCOPES = 'openid profile offline_access User.Read Files.Read';
+  const SCOPES = 'openid profile offline_access User.Read Files.ReadWrite.All';  // .All: også Teams-/SharePoint-mapper
   const GRAPH = 'https://graph.microsoft.com/v1.0';
   const KEY = 'a104-ms';
   const FLOW_KEY = 'a104-ms-flow';
@@ -101,14 +103,16 @@ const MS = (() => {
     return session.access;
   }
 
-  /** GET mod Microsoft Graph. `path` er relativ (/me/…) eller en fuld @odata.nextLink. */
-  async function get(path, retry = true) {
-    const res = await fetch(path.startsWith('https://') ? path : GRAPH + path, { headers: { Authorization: `Bearer ${await token()}` } });
-    if (res.status === 401 && retry) { session.expires = 0; return get(path, false); }
+  /** Kald til Microsoft Graph. `path` er relativ (/me/…) eller en fuld @odata.nextLink. */
+  async function request(method, path, { body, type } = {}, retry = true) {
+    const headers = { Authorization: `Bearer ${await token()}` };
+    if (type) headers['Content-Type'] = type;
+    const res = await fetch(path.startsWith('https://') ? path : GRAPH + path, { method, headers, body });
+    if (res.status === 401 && retry) { session.expires = 0; return request(method, path, { body, type }, false); }
     if (res.status === 429 || res.status === 503) {
       const wait = Math.min(Number(res.headers.get('Retry-After')) || 2, 20);
       await new Promise((r) => setTimeout(r, wait * 1000));
-      return get(path, retry);
+      return request(method, path, { body, type }, retry);
     }
     const data = await res.json().catch(() => ({}));
     if (!res.ok) {
@@ -118,6 +122,37 @@ const MS = (() => {
       throw Object.assign(new Error(msg), { code, status: res.status });
     }
     return data;
+  }
+
+  const get = (path) => request('GET', path);
+
+  /** Mappen bag et link fra SharePoint/OneDrive (fx projektmappens adresse fra QR-koden): {driveId, id, webUrl}. */
+  async function resolve(webUrl) {
+    const share = `u!${b64url(new TextEncoder().encode(webUrl.split('?')[0]))}`;
+    const d = await get(`/shares/${share}/driveItem?$select=id,name,webUrl,parentReference`);
+    return { driveId: d.parentReference.driveId, id: d.id, webUrl: d.webUrl };
+  }
+
+  /** Gem en fil i `folderId` (på `driveId`) under den relative sti `path` (»C05 Analyse/C05.06 Foto og video/navn.jpg«).
+   *  Manglende mapper oprettes; findes navnet, får den nye fil et »(1)«-navn i stedet for at overskrive. */
+  async function upload(driveId, folderId, path, file, progress) {
+    const target = `/drives/${driveId}/items/${folderId}:/${path.split('/').map(encodeURIComponent).join('/')}:`;
+    if (file.size <= 4 * 1024 * 1024) {
+      return request('PUT', `${target}/content?@microsoft.graph.conflictBehavior=rename`, { body: file, type: file.type || 'application/octet-stream' });
+    }
+    const { uploadUrl } = await request('POST', `${target}/createUploadSession`,
+      { body: JSON.stringify({ item: { '@microsoft.graph.conflictBehavior': 'rename' } }), type: 'application/json' });
+    const CHUNK = 320 * 1024 * 12;  // skal gå op i 320 KiB
+    let item = null;
+    for (let at = 0; at < file.size; at += CHUNK) {
+      const part = file.slice(at, at + CHUNK);
+      const res = await fetch(uploadUrl, { method: 'PUT', body: part,
+        headers: { 'Content-Range': `bytes ${at}-${at + part.size - 1}/${file.size}` } });
+      if (!res.ok) throw Object.assign(new Error(`Upload fejlede (HTTP ${res.status})`), { status: res.status });
+      if (res.status === 200 || res.status === 201) item = await res.json();
+      if (progress) progress(Math.min(at + CHUNK, file.size), file.size);
+    }
+    return item;
   }
 
   /** Alle sider af en liste (value + @odata.nextLink). */
@@ -141,6 +176,6 @@ const MS = (() => {
     configured,
     get signedIn() { return !!(session && (session.refresh || session.access)); },
     get account() { return session ? { name: session.name, user: session.user } : null; },
-    login, handleRedirect, logout, get, all,
+    login, handleRedirect, logout, get, all, resolve, upload,
   };
 })();
