@@ -2,7 +2,7 @@
 // A104 Navigator – web-app (PWA). Brugerfladen er skrevet her; al logik (søgning, dokumentfinder, BR18, AB 18 …)
 // er A104 Navigators egen Python-kerne, der kører i worker.js med Pyodide.
 
-const BUILD = '2.19.0-ee73f71d1b';
+const BUILD = '2.19.0-2061a9f8eb';
 const VERSION = '2.19.0';
 
 // =========================================================================== hjælpere
@@ -1451,7 +1451,7 @@ async function snapshotFromQr(text) {
     items.push({ path, folder: false, size, modified: new Date(minutes * 60000).toISOString(), url: urlFor(path, true), by: by || '',
       approval: approval || '' });
   }
-  return { format: 'a104-projekt', project: { name: data.n, project_id: data.p, where: data.w, url: data.u, inbox: data.i || '' }, created: data.c,
+  return { format: 'a104-projekt', project: { name: data.n, project_id: data.p, where: data.w, url: data.u, inbox: data.i || '', mark: data.m || '' }, created: data.c,
     truncated: data.t, items };
 }
 
@@ -1610,7 +1610,7 @@ class ProjectPage {
     const pr = data.project || {};
     const name = pr.name || fallbackName;
     const p = { id: `file:${name}`, source: 'file', name, where: pr.where || '', url: pr.url || '', projectId: pr.project_id || '',
-      inbox: pr.inbox || '' };
+      inbox: pr.inbox || '', mark: pr.mark || '' };
     const items = data.items.map((i) => ({ id: i.path, name: i.path.split('/').pop(), path: i.path, folder: !!i.folder, size: i.size || 0,
       modified: i.modified || '', url: i.url || '', by: i.by || '', approval: i.approval || '' }));
     await store.set(`project-scan:${p.id}`, { at: data.created || new Date().toISOString(), truncated: !!data.truncated, items, file: true });
@@ -1911,18 +1911,23 @@ class ProjectPage {
    *  Navnet ændres ikke her: kameraets tal-navn får pc'en til at læse billedet i stedet for at gætte ud fra navnet. */
   showQuickUpload(file) {
     const d = this.detail;
+    // »[A104 <projekt>] « foran navnet: så kan OneDrive-appen gemme filen hvor som helst (bare tryk Upload), og
+    // pc'en finder den alligevel (phone_export.collect_marked) og fjerner mærket igen
+    const mark = this.project.mark || `[A104 ${this.project.name.replace(/[<>:"/\\|?*\x00-\x1f]+/g, '').replace(/\s+/g, ' ').trim()}] `;
+    const marked = new File([file], `${mark}${file.name}`, { type: file.type, lastModified: file.lastModified });
     const preview = file.type.startsWith('image/') ? h('img', { class: 'upload-preview', alt: '', src: URL.createObjectURL(file) }) : null;
     d.doc.replaceChildren(
       h('h1', {}, '📥 Læg i mappe'),
       preview || '',
       h('p', { class: 'muted break' }, `${file.name} · ${fmtSize(file.size)}`),
       h('div', { class: 'toolbar', style: 'margin-top:12px' },
-        h('button', { type: 'button', class: 'btn primary', onclick: () => shareFile(file, this.project.inbox) }, '📥 Læg i mappe'),
+        h('button', { type: 'button', class: 'btn primary', onclick: () => shareFile(marked, 'OneDrive – tryk bare Upload') }, '📥 Læg i mappe'),
         h('button', { type: 'button', class: 'btn', onclick: () => this.showUpload(file) }, 'Vælg selv mappe og navn…')),
       h('ol', { class: 'steps' },
-        h('li', {}, 'Tryk »Læg i mappe«, og vælg ', h('b', {}, 'OneDrive'), ' i delingsmenuen.'),
-        h('li', {}, 'Gem filen i: ', h('b', { class: 'break' }, this.project.inbox), ' – det er den samme mappe hver gang.'),
-        h('li', {}, 'A104 Navigator på pc’en finder selv den rigtige mappe og giver filen et A104-navn – ud fra indholdet, '
+        h('li', {}, 'Tryk »Læg i mappe«, vælg ', h('b', {}, 'OneDrive'), ' i delingsmenuen, og tryk ', h('b', {}, 'Upload'),
+          '. Du skal ikke vælge mappe – »Mine filer« er fint.'),
+        h('li', {}, 'A104 Navigator på pc’en finder filen, regner selv ud hvor den skal ligge i projektet og giver den '
+          + 'A104-kode og -navn – ud fra indholdet, '
           + 'tekstgenkendelse og tegningshoved, ligesom »Placér korrekt«. Den kommer i Loggen som ', h('i', {}, '⏳ Mangler godkendelse'), '.'),
         h('li', { class: 'muted' }, 'Det sker, når programmet kører på pc’en med projektet åbent.')));
     d.body.scrollTop = 0;
