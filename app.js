@@ -2,7 +2,7 @@
 // A104 Navigator – web-app (PWA). Brugerfladen er skrevet her; al logik (søgning, dokumentfinder, BR18, AB 18 …)
 // er A104 Navigators egen Python-kerne, der kører i worker.js med Pyodide.
 
-const BUILD = '2.19.0-c8b4bfbe4c';
+const BUILD = '2.19.0-aa89be9b09';
 const VERSION = '2.19.0';
 
 // =========================================================================== hjælpere
@@ -1477,12 +1477,44 @@ async function shareFile(file, target) {
 /** 📥 Læg i mappe over nettet: filen sendes til projektets hemmelige adresse hos ntfy.sh (fra QR-koden), og
  *  Windows-programmet henter den derfra og lægger den på plads (phone_export.relay_fetch). Ingen delingsmenu, ingen
  *  login – telefonen og pc'en skal bare have internet. ntfy.sh sletter filen efter 3 timer. */
-const RELAY_MAX = 15 * 1024 * 1024;
-async function sendToPc(file, project) {
-  if (file.size > RELAY_MAX) throw new Error('Filen er over 15 MB – brug »Del med OneDrive« i stedet.');
-  const url = `${project.relay}?filename=${encodeURIComponent(file.name)}&message=${encodeURIComponent(project.name)}`;
-  const r = await fetch(url, { method: 'PUT', body: file });
-  if (!r.ok) throw new Error(`Kunne ikke sende (${r.status}).`);
+// ntfy.sh tager højst 2 MB pr. fil uden betaling: store fotos gøres mindre (stadig skarpe nok til tekstgenkendelse
+// af et tegningshoved), og større filer sendes i dele, som pc'en samler igen (phone_export.relay_fetch)
+const RELAY_MAX = 25 * 1024 * 1024;
+const RELAY_PART = 1900 * 1024;
+const PHOTO_SIDE = 3000;
+
+async function shrinkPhoto(file) {
+  if (!/^image\/(jpeg|png|webp)$/.test(file.type) || file.size <= RELAY_PART) return file;
+  try {
+    const bmp = await createImageBitmap(file, { imageOrientation: 'from-image' });
+    const scale = Math.min(1, PHOTO_SIDE / Math.max(bmp.width, bmp.height));
+    const c = h('canvas', { width: Math.round(bmp.width * scale), height: Math.round(bmp.height * scale) });
+    c.getContext('2d').drawImage(bmp, 0, 0, c.width, c.height);
+    bmp.close();
+    const blob = await new Promise((ok) => c.toBlob(ok, 'image/jpeg', 0.85));
+    if (!blob || blob.size >= file.size) return file;
+    return new File([blob], file.name.replace(/\.[^.]+$/, '') + '.jpg', { type: 'image/jpeg', lastModified: file.lastModified });
+  } catch { return file; }
+}
+
+async function sendToPc(file, project, progress) {
+  file = await shrinkPhoto(file);
+  if (file.size > RELAY_MAX) throw new Error('Filen er over 25 MB – brug »Del med OneDrive« i stedet.');
+  const n = Math.max(1, Math.ceil(file.size / RELAY_PART));
+  const id = [...crypto.getRandomValues(new Uint8Array(8))].map((b) => b.toString(16).padStart(2, '0')).join('');
+  for (let i = 0; i < n; i++) {
+    const message = n === 1 ? project.name : `${project.name}\nA104-DEL ${id} ${i + 1}/${n}`;
+    const url = `${project.relay}?filename=${encodeURIComponent(file.name)}&message=${encodeURIComponent(message)}`;
+    const r = await fetch(url, { method: 'PUT', body: file.slice(i * RELAY_PART, (i + 1) * RELAY_PART) });
+    if (!r.ok) {
+      const why = await r.json().catch(() => ({}));
+      throw new Error(r.status === 413 || r.status === 429
+        ? 'ntfy.sh’s grænse for i dag er nået – brug »Del med OneDrive« i stedet.'
+        : `Kunne ikke sende (${r.status}${why.error ? `: ${why.error}` : ''}).`);
+    }
+    if (progress) progress(i + 1, n);
+  }
+  return file;
 }
 
 /** Mangler filen godkendelse? (»Mangler godkendelse« / »Ændret – mangler godkendelse« fra Windows-programmet) */
@@ -1932,7 +1964,7 @@ class ProjectPage {
     d.body.scrollTop = 0;
     d.reveal();
     try {
-      await sendToPc(file, this.project);
+      await sendToPc(file, this.project, (i, n) => { if (n > 1) status.textContent = `Sender til pc’en … ${Math.round(100 * i / n)} %`; });
       status.className = 'ok-text';
       status.textContent = '✓ Sendt. A104 Navigator på pc’en finder selv den rigtige mappe, giver filen A104-kode og -navn '
         + 'og skriver den i Loggen som ⏳ Mangler godkendelse.';
