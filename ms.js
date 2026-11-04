@@ -5,7 +5,7 @@
 // selv, skal godkende den én gang. Login-oplysningerne (tokens) gemmes i browseren på denne enhed og sendes kun til Microsoft.
 
 const MS = (() => {
-  const CLIENT_ID = 'a9a85b77-5200-44b4-9950-5844fb61b4f1';
+  const CLIENT_ID = '5457c050-b66e-4e6d-8303-c8ae2ced7473';
   const TENANT = 'common';
   const AUTHORITY = `https://login.microsoftonline.com/${TENANT}/oauth2/v2.0`;
   const SCOPES = 'openid profile offline_access User.Read Files.ReadWrite.All';  // .All: også Teams-/SharePoint-mapper

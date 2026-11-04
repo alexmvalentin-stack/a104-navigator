@@ -2,7 +2,7 @@
 // A104 Navigator – web-app (PWA). Brugerfladen er skrevet her; al logik (søgning, dokumentfinder, BR18, AB 18 …)
 // er A104 Navigators egen Python-kerne, der kører i worker.js med Pyodide.
 
-const BUILD = '2.21.1-626a1983fd';
+const BUILD = '2.21.1-184b389e8a';
 const VERSION = '2.21.1';
 
 // =========================================================================== hjælpere
