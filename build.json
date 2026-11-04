@@ -1,5 +1,5 @@
 {
-  "build": "2.19.0-bd04cc9195",
-  "version": "2.19.0",
+  "build": "2.21.0-2a7c63ccbe",
+  "version": "2.21.0",
   "pyodide": "0.27.2"
 }
