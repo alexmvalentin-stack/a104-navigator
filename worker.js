@@ -1,5 +1,5 @@
 // Kører A104 Navigators Python-kerne (web_api.py) i Pyodide – i baggrunden, så brugerfladen ikke fryser.
-const BUILD = '2.21.1-802bfd3d2b';
+const BUILD = '2.21.1-626a1983fd';
 const PYODIDE_URL = 'https://cdn.jsdelivr.net/pyodide/v0.27.2/full/';
 
 importScripts(PYODIDE_URL + 'pyodide.js');

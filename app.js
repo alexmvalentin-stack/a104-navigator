@@ -2,7 +2,7 @@
 // A104 Navigator – web-app (PWA). Brugerfladen er skrevet her; al logik (søgning, dokumentfinder, BR18, AB 18 …)
 // er A104 Navigators egen Python-kerne, der kører i worker.js med Pyodide.
 
-const BUILD = '2.21.1-802bfd3d2b';
+const BUILD = '2.21.1-626a1983fd';
 const VERSION = '2.21.1';
 
 // =========================================================================== hjælpere
@@ -1816,8 +1816,9 @@ class ProjectPage {
     this.refreshBtn = p.source === 'file'
       ? h('button', { type: 'button', class: 'btn', onclick: () => this.scanQr(), title: 'Scan QR-koden fra »📱 Mobil (beta)« på pc’en igen' }, '📷 Opdatér (scan)')
       : h('button', { type: 'button', class: 'btn', onclick: () => this.load(true) }, '⟳ Opdater');
-    this.liveBtn = p.source === 'file' && this.canSaveDirect()
-      ? h('button', { type: 'button', class: 'btn', onclick: () => this.load(false), title: 'Hent den nyeste filliste fra OneDrive/Teams' }, '⟳ Opdater') : null;
+    this.liveBtn = p.source === 'file' && MS.configured && p.url // ikke logget ind endnu: knappen fører til login
+      ? h('button', { type: 'button', class: 'btn', onclick: () => (MS.signedIn ? this.load(false) : MS.login('#/project')),
+        title: 'Hent den nyeste filliste fra OneDrive/Teams' }, MS.signedIn ? '⟳ Opdater' : '⟳ Log ind og opdatér') : null;
     const list = listPane();
     this.scroll = list.scroll;
     this.detail = new Pane({ empty: 'Vælg en mappe.' });
