@@ -2,8 +2,8 @@
 // A104 Navigator – web-app (PWA). Brugerfladen er skrevet her; al logik (søgning, dokumentfinder, BR18, AB 18 …)
 // er A104 Navigators egen Python-kerne, der kører i worker.js med Pyodide.
 
-const BUILD = '2.21.0-2a7c63ccbe';
-const VERSION = '2.21.0';
+const BUILD = '2.21.1-802bfd3d2b';
+const VERSION = '2.21.1';
 
 // =========================================================================== hjælpere
 const $ = (sel, el = document) => el.querySelector(sel);
@@ -1536,10 +1536,38 @@ function phoneName(file) {
 /** Mangler filen godkendelse? (»Mangler godkendelse« / »Ændret – mangler godkendelse« fra Windows-programmet) */
 const pendingApproval = (f) => /mangler godkendelse/i.test(f.approval || '');
 
+/** Den nyeste liste fra OneDrive/Teams + det, kun pc'en ved: uændrede filer beholder initialer og godkendelse fra
+ *  Windows-programmet. Nye og ændrede filer står uden godkendelse, til projektet scannes igen. */
+function mergeLive(old, live) {
+  const before = new Map(old.map((i) => [i.path.toLowerCase(), i]));
+  return live.map((i) => {
+    const o = before.get(i.path.toLowerCase());
+    if (o && i.folder) return { ...o, url: o.url || i.url };
+    const same = o && Math.abs(new Date(i.modified) - new Date(o.modified)) <= 120000; // pc'ens tider er afrundet til minutter
+    return same ? { ...o, url: o.url || i.url } : { ...i, id: i.path, approval: '' };
+  });
+}
+
+/** Ændrer listen noget på det, der vises? */
+const scanKey = (items) => items.map((i) => `${i.path}|${i.modified}|${i.size}|${i.approval || ''}|${i.by || ''}`).sort().join('\n');
+
+const LIVE_EVERY = 5 * 60000;   // mens projektet står åbent
+const LIVE_RETURN = 60000;      // når man vender tilbage til appen – ikke oftere end dette
+
 class ProjectPage {
   constructor(root, params) {
     this.root = h('div', { class: 'page' });
     root.append(this.root);
+    // Hold listen opdateret: når man vender tilbage til appen, når nettet er tilbage, og med jævne mellemrum
+    const stop = () => {
+      document.removeEventListener('visibilitychange', this.onReturn);
+      window.removeEventListener('online', this.onReturn);
+      clearInterval(this.liveTimer);
+    };
+    this.onReturn = () => { if (this.root.isConnected) this.autoRefresh(LIVE_RETURN); else stop(); };
+    document.addEventListener('visibilitychange', this.onReturn);
+    window.addEventListener('online', this.onReturn);
+    this.liveTimer = setInterval(() => { if (this.root.isConnected) this.autoRefresh(LIVE_EVERY - 5000); else stop(); }, LIVE_EVERY);
     this.init(params);
   }
 
@@ -1788,6 +1816,8 @@ class ProjectPage {
     this.refreshBtn = p.source === 'file'
       ? h('button', { type: 'button', class: 'btn', onclick: () => this.scanQr(), title: 'Scan QR-koden fra »📱 Mobil (beta)« på pc’en igen' }, '📷 Opdatér (scan)')
       : h('button', { type: 'button', class: 'btn', onclick: () => this.load(true) }, '⟳ Opdater');
+    this.liveBtn = p.source === 'file' && this.canSaveDirect()
+      ? h('button', { type: 'button', class: 'btn', onclick: () => this.load(false), title: 'Hent den nyeste filliste fra OneDrive/Teams' }, '⟳ Opdater') : null;
     const list = listPane();
     this.scroll = list.scroll;
     this.detail = new Pane({ empty: 'Vælg en mappe.' });
@@ -1803,50 +1833,97 @@ class ProjectPage {
         h('button', { type: 'button', class: 'btn primary', onclick: () => this.pickUpload(true),
           title: 'Tag et foto eller vælg en fil – pc’en finder selv den rigtige mappe' }, '📥 Læg i mappe'),
         h('button', { type: 'button', class: 'btn', onclick: () => this.pickCheck(), title: 'Vælg filer fra OneDrive på telefonen og tjek navngivningen' }, '🔍 Tjek filer'),
-        this.refreshBtn, h('button', { type: 'button', class: 'btn', onclick: () => this.showStart() }, 'Skift projekt')),
+        this.liveBtn, this.refreshBtn, h('button', { type: 'button', class: 'btn', onclick: () => this.showStart() }, 'Skift projekt')),
       this.split);
     this.scroll.append(h('p', { class: 'empty' }, 'Henter projektet…'));
     const cached = refresh ? null : await store.get(`project-scan:${p.id}`, null);
-    if (cached) { this.apply(cached); if (p.source !== 'file' && navigator.onLine && MS.signedIn) this.load(false); } else if (p.source === 'file') this.showStart('Projektfilen er ikke gemt på denne enhed – vælg den igen.'); else this.load(true);
+    if (cached) { await this.apply(cached); this.autoRefresh(0); } else if (p.source === 'file') this.showStart('Projektfilen er ikke gemt på denne enhed – vælg den igen.'); else this.load(true);
   }
 
-  async load(visible) {
+  /** Automatisk i baggrunden: stille – fejl og manglende net viser bare den sidst gemte liste. */
+  autoRefresh(minAge) {
+    if (document.hidden || !navigator.onLine || !this.project || !this.canSaveDirect()) return;
+    if (minAge && Date.now() - (this.lastLive || 0) < minAge) return;
+    this.load(false, true);
+  }
+
+  async load(visible, silent = false) {
     const p = this.project;
-    if (!MS.signedIn) { if (!this.scan) this.showLogin('Log ind for at hente projektet.'); else toast('Log ind for at opdatere projektet.'); return; }
-    this.refreshBtn.disabled = true;
-    const old = this.refreshBtn.textContent;
+    if (!MS.signedIn) {
+      if (silent) return;
+      if (!this.scan) this.showLogin('Log ind for at hente projektet.'); else toast('Log ind for at opdatere projektet.');
+      return;
+    }
+    if (this.loading) return;
+    this.loading = true;
+    this.lastLive = Date.now();
+    const btn = silent ? null : (this.liveBtn || this.refreshBtn);
+    const old = btn?.textContent;
+    if (btn) btn.disabled = true;
     try {
-      const res = await scanDrive(p.driveId, p.itemId, (folders, files) => {
-        this.refreshBtn.textContent = `Læser… ${folders} mapper`;
+      const root = await this.driveRoot();
+      const res = await scanDrive(root.driveId, root.id, (folders, files) => {
+        if (btn) btn.textContent = `Læser… ${folders} mapper`;
         if (visible && !this.scan) this.scroll.replaceChildren(h('p', { class: 'empty' }, `Læser projektet… ${folders} mapper, ${files} elementer`));
       });
-      const scan = { at: new Date().toISOString(), truncated: res.truncated, items: res.items };
-      await store.set(`project-scan:${p.id}`, scan);
-      if (this.project === p && this.root.isConnected) this.apply(scan);
+      const key = `project-scan:${p.id}`;
+      const cached = await store.get(key, null);
+      if (cached && p.source === 'file' && (res.truncated || !res.items.length) && cached.items.length) return; // pc'ens liste er mere komplet
+      const items = cached && p.source === 'file' ? mergeLive(cached.items, res.items) : res.items;
+      const changed = !cached || scanKey(items) !== scanKey(cached.items);
+      const scan = { at: new Date().toISOString(), truncated: res.truncated, items };
+      await store.set(key, scan);
+      if (this.project !== p || !this.split?.isConnected) return;
+      if (changed) await this.apply(scan, { quiet: silent });
+      else { this.scan = scan; this.showSummary(); }
+      if (!silent) toast(changed ? 'Listen er opdateret' : 'Listen er allerede opdateret');
     } catch (err) {
+      if (err.status === 404) { delete p.drive; await this.saveState(); }
+      if (silent) { console.warn('Automatisk opdatering af projektet:', err.message); return; }
       if (err.code === 'login_required' && !this.scan) return this.showLogin(err.message);
       toast(`Kunne ikke hente projektet: ${err.message}`);
       if (!this.scan) this.scroll.replaceChildren(h('p', { class: 'empty' }, err.message));
     } finally {
-      this.refreshBtn.disabled = false;
-      this.refreshBtn.textContent = old;
+      this.loading = false;
+      if (btn) { btn.disabled = false; btn.textContent = old; }
     }
   }
 
-  async apply(scan) {
+  /** `quiet`: opdatering i baggrunden – åbne mapper, rullepositioner og en åben fil eller upload bliver stående. */
+  async apply(scan, { quiet = false } = {}) {
     const status = await api('project_scan', scan.items.map((i) => [i.id, i.path, i.folder, i.size, i.modified]));
+    const openRows = quiet && this.rows ? new Set([...this.rows].filter(([, r]) => !r.li.classList.contains('collapsed')).map(([path]) => path)) : null;
+    const treeTop = this.scroll.scrollTop;
+    const showingFolder = this.folderView && this.detail.doc.lastChild === this.folderView;
     this.scan = scan;
     this.status = status;
-    const s = status.summary;
+    this.showSummary();
+    this.buildTree();
+    const keep = this.folder != null && (this.folder === '' || status.folders[this.folder]) ? this.folder : '';
+    if (!quiet) { this.showFolder(keep, { reveal: false }); return; }
+    for (const [path, r] of this.rows) {
+      const tw = r.li.querySelector(':scope > .node .tw');
+      if (tw.classList.contains('leaf')) continue;
+      r.li.classList.toggle('collapsed', !openRows.has(path));
+      tw.textContent = openRows.has(path) ? '▾' : '▸';
+    }
+    if (showingFolder) {
+      const top = this.detail.body.scrollTop;
+      this.showFolder(keep, { reveal: false });
+      this.detail.body.scrollTop = top;
+    } else if (this.rows.get(keep)) select(this.tree, this.rows.get(keep).row);
+    this.scroll.scrollTop = treeTop;
+  }
+
+  showSummary() {
+    const scan = this.scan;
+    const s = this.status.summary;
     const when = fmtDate(scan.at);
     const waiting = scan.items.filter((i) => !i.folder && pendingApproval(i)).length;
     this.summary.innerHTML = `${esc(this.project.where || '')}${this.project.where ? ' · ' : ''}<b>${s.files}</b> filer i ${s.folders} mapper · `
       + `<span class="ok-text">✓ ${s.ok} følger A104</span> · <span class="warn-text">⚠ ${s.issues} med bemærkninger</span>`
       + (waiting ? ` · <span class="warn-text">⏳ ${waiting} mangler godkendelse</span>` : '')
-      + `<br><span class="muted">${scan.file ? 'Gemt fra Windows-programmet' : 'Hentet'} ${esc(when)}${scan.truncated ? ` · kun de første ${SCAN_LIMIT} elementer` : ''}</span>`;
-    this.buildTree();
-    const keep = this.folder != null && (this.folder === '' || status.folders[this.folder]) ? this.folder : '';
-    this.showFolder(keep, { reveal: false });
+      + `<br><span class="muted">${scan.file ? 'Gemt fra Windows-programmet' : 'Opdateret'} ${esc(when)}${scan.truncated ? ` · kun de første ${SCAN_LIMIT} elementer` : ''}</span>`;
   }
 
   buildTree() {
@@ -1927,6 +2004,7 @@ class ProjectPage {
       d.doc.append(h('h1', {}, text ? `Filer med »${this.filter.value.trim()}«` : pending ? 'Mangler godkendelse' : 'Filer med bemærkninger'),
         h('p', { class: 'muted' }, `${hits.length} filer i hele projektet${hits.length > 300 ? ' – de første 300 vises' : ''}`),
         h('div', { class: 'list' }, hits.slice(0, 300).map((f) => this.fileRow(f, true))));
+      this.folderView = d.doc.lastChild;
       select(this.tree, null);
       if (reveal && isNarrow()) d.reveal();
       return;
@@ -1951,6 +2029,7 @@ class ProjectPage {
     }
     d.doc.append(files.length ? h('div', { class: 'list' }, files.map((f) => this.fileRow(f, false)))
       : h('p', { class: 'muted' }, 'Ingen filer direkte i mappen.'));
+    this.folderView = d.doc.lastChild;
     if (reveal) d.reveal();
   }
 
