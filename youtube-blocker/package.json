@@ -1,0 +1,10 @@
+{
+  "name": "youtube-blocker",
+  "version": "1.0.0",
+  "description": "Bloker og åbn YouTube på børnenes iPhone med en QR-kode (DNS-over-HTTPS).",
+  "main": "server.js",
+  "private": true,
+  "license": "MIT",
+  "engines": { "node": ">=18" },
+  "scripts": { "start": "node server.js" }
+}
