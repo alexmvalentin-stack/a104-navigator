@@ -1,0 +1,10 @@
+{
+  "permissions": {
+    "deny": [
+      "Read(./jsqr.js)",
+      "Read(./*.zip)",
+      "Read(./data/**)",
+      "Read(./icons/**)"
+    ]
+  }
+}
