@@ -186,6 +186,20 @@ details.group > summary::before { content: "▸"; display: inline-block; width: 
 details.group[open] > summary::before { content: "▾"; }
 details.group > summary:hover { background: var(--surface-alt); }
 
+/* Microsoft-konti */
+.account-row { display: flex; flex-wrap: wrap; justify-content: space-between; align-items: center; gap: 6px;
+  padding: 8px 0; border-bottom: 1px solid var(--border); }
+.account-row:last-child { border-bottom: 0; }
+.account-row .toolbar { margin: 0; }
+
+/* 🕒 Seneste filer over mappetræet i Projekt */
+.recent-box { border: 1px solid var(--border); border-radius: 8px; background: var(--surface-alt); margin: 4px 0 10px; }
+.recent-box > summary { list-style: none; cursor: pointer; font-weight: 600; padding: 8px 10px; font-size: 14px; }
+.recent-box > summary::-webkit-details-marker { display: none; }
+.recent-box > summary::before { content: "▸"; display: inline-block; width: 1.2em; color: var(--muted); }
+.recent-box[open] > summary::before { content: "▾"; }
+.recent-box .list { padding: 0 4px 6px; }
+
 /* mappetræ */
 .tree, .tree ul { list-style: none; margin: 0; padding: 0; }
 .tree ul { padding-left: 18px; }

@@ -2,7 +2,7 @@
 // A104 Navigator – web-app (PWA). Brugerfladen er skrevet her; al logik (søgning, dokumentfinder, BR18, AB 18 …)
 // er A104 Navigators egen Python-kerne, der kører i worker.js med Pyodide.
 
-const BUILD = '2.22.0-77b64eb7ee';
+const BUILD = '2.22.0-cc0104e574';
 const VERSION = '2.22.0';
 
 // =========================================================================== hjælpere
@@ -262,6 +262,23 @@ function defaultLink(href, owner) {
 // =========================================================================== byggeklodser
 function pageHead(title, subtitle) {
   return h('div', { class: 'page-head' }, h('h1', {}, title), subtitle ? h('p', {}, subtitle) : null);
+}
+
+/** Dine Microsoft-konti (fx skole og privat): brug, log ud, tilføj. `onChange` kaldes efter et skift eller log ud. */
+function msAccountsCard(returnHash, onChange) {
+  const accounts = MS.accounts;
+  const changed = (text) => { toast(text); if (onChange) onChange(); };
+  return h('div', { class: 'card' }, h('h2', {}, accounts.length > 1 ? 'Microsoft-konti' : 'Microsoft-konto'),
+    accounts.length ? h('div', { class: 'accounts' }, accounts.map((a) => h('div', { class: 'account-row' },
+      h('div', { class: 'break' }, h('b', {}, a.name || a.user), a.active ? h('span', { class: 'ok-text' }, ' ✓ i brug') : '',
+        h('div', { class: 'muted' }, a.user + (a.signedIn ? '' : ' · skal logge ind igen'))),
+      h('div', { class: 'toolbar' },
+        !a.active && a.signedIn ? h('button', { type: 'button', class: 'btn flat', onclick: () => { MS.use(a.key); changed(`Bruger nu ${a.name || a.user}`); } }, 'Brug') : '',
+        !a.signedIn ? h('button', { type: 'button', class: 'btn flat', onclick: () => { MS.use(a.key); MS.login(returnHash); } }, 'Log ind') : '',
+        h('button', { type: 'button', class: 'btn flat', onclick: () => { MS.logout(a.key); changed(`${a.name || a.user} er logget ud`); } }, 'Log ud')))))
+      : h('p', { class: 'muted' }, 'Ingen konti endnu.'),
+    h('button', { type: 'button', class: 'btn', style: 'margin-top:10px', onclick: () => MS.login(returnHash, { add: true }) }, '➕ Tilføj Microsoft-konto'),
+    h('p', { class: 'muted' }, 'Fx din skolekonto og din private. Hvert projekt husker, hvilken konto der har adgang til det.'));
 }
 
 function row({ code = '', title = '', sub = '', score = '', dim = false }, onclick) {
@@ -1678,7 +1695,8 @@ class ProjectPage {
         MS.configured ? h('div', { class: 'card' }, h('h2', {}, 'Direkte fra OneDrive'),
           h('p', { class: 'muted' }, 'Log ind med din skolekonto og vælg mappen – altid opdateret.'),
           h('button', { type: 'button', class: 'btn', onclick: () => (MS.signedIn ? this.showPicker() : this.showLogin()) },
-            MS.signedIn ? 'Vælg mappe i OneDrive' : 'Log ind med Microsoft')) : null));
+            MS.signedIn ? 'Vælg mappe i OneDrive' : 'Log ind med Microsoft')) : null,
+        MS.configured && MS.accounts.length ? msAccountsCard('#/project', () => this.showStart()) : null));
   }
 
   pickFile() {
@@ -1832,20 +1850,18 @@ class ProjectPage {
     const trail = [...crumbs, folder];
     const nav = h('div', { class: 'crumbs' }, trail.map((c, i) => h('button', { type: 'button', class: 'btn flat',
       disabled: i === trail.length - 1 ? 'disabled' : null, onclick: () => this.browse(c, trail.slice(0, i)) }, i ? c.name : '☁ OneDrive')));
-    const acc = MS.account || {};
     const recent = this.state.list.filter((p) => p.id !== this.project?.id);
     this.root.append(pageHead('Vælg projektmappe', 'Gå ned til den mappe, der er dit projekt (fx den med C01, C02 …), og tryk »Vælg«.'),
       nav,
       crumbs.length ? h('div', { class: 'toolbar' }, h('button', { type: 'button', class: 'btn primary', onclick: () => this.choose({
         id: `${folder.driveId}!${folder.itemId}`, driveId: folder.driveId, itemId: folder.itemId, name: folder.name, url: folder.url,
+        msAccount: MS.account?.key || '',
         where: trail.slice(0, -1).map((c, i) => (i ? c.name : 'OneDrive')).join(' › ') }) }, `✓ Vælg »${folder.name}«`)) : null,
       h('div', { class: 'settings' },
         h('div', { class: 'card' }, list),
         recent.length ? h('div', { class: 'card' }, h('h2', {}, 'Tidligere projekter'), h('div', { class: 'list' },
           recent.map((p) => row({ title: `📁 ${p.name}`, sub: p.where }, () => this.choose(p))))) : null,
-        h('div', { class: 'card' }, h('h2', {}, 'Konto'),
-          h('p', { class: 'muted' }, `Logget ind som ${acc.name || ''} ${acc.user ? `(${acc.user})` : ''}`),
-          h('button', { type: 'button', class: 'btn', onclick: () => this.logout() }, 'Log ud'))));
+        msAccountsCard('#/project', () => (MS.signedIn ? this.showPicker() : this.showStart()))));
     try {
       const kids = await MS.all(`/drives/${folder.driveId}/items/${folder.itemId}/children?$select=id,name,folder,webUrl&$top=999`);
       const subs = kids.filter((k) => k.folder).sort((a, b) => a.name.localeCompare(b.name, 'da', { numeric: true }));
@@ -1938,6 +1954,7 @@ class ProjectPage {
   // --------------------------------------------------------------------- projektet
   async openProject(refresh = false) {
     const p = this.project;
+    if (p.msAccount && MS.has(p.msAccount)) MS.use(p.msAccount);
     this.reset(true);
     this.summary = h('p', {}, '');
     this.filter = h('input', { type: 'search', placeholder: 'Søg efter fil – fx referat eller C05', 'aria-label': 'Søg i projektet' });
@@ -2116,7 +2133,20 @@ class ProjectPage {
       return li;
     };
     this.tree = h('ul', { class: 'tree list' }, make(null, 0));
-    this.scroll.replaceChildren(this.tree);
+    this.scroll.replaceChildren(this.recentBox(), this.tree);
+  }
+
+  /** 🕒 Seneste filer – de nyeste filer i hele projektet, over mappestrukturen. Fold ud/sammen huskes på enheden. */
+  recentBox() {
+    const RECENT = 8;
+    const newest = this.files.filter((f) => f.modified).sort((a, b) => new Date(b.modified) - new Date(a.modified)).slice(0, RECENT);
+    if (!newest.length) return '';
+    let open = true;
+    try { open = localStorage.getItem('a104-recent-open') !== '0'; } catch { /* privat vindue */ }
+    const box = h('details', { class: 'recent-box', open: open ? 'open' : null },
+      h('summary', {}, '🕒 Seneste filer'), h('div', { class: 'list' }, newest.map((f) => this.fileRow(f, true))));
+    box.addEventListener('toggle', () => { try { localStorage.setItem('a104-recent-open', box.open ? '1' : '0'); } catch { /* ok */ } });
+    return box;
   }
 
   folderUrl() {
@@ -2203,10 +2233,13 @@ class ProjectPage {
   /** Projektmappen i OneDrive/Teams ({driveId, id}). Projekter fra pc'en (QR) kender kun adressen – den slås op én gang. */
   async driveRoot() {
     const p = this.project;
+    if (p.msAccount && MS.has(p.msAccount)) MS.use(p.msAccount);  // projektets egen Microsoft-konto (fx skolens)
     if (p.driveId && p.itemId) return { driveId: p.driveId, id: p.itemId };
-    if (!p.drive) {
+    if (!p.drive || (p.msAccount && !MS.has(p.msAccount))) {
       if (!p.url) throw new Error('Projektet har ingen adresse i OneDrive/Teams – det ligger kun på pc’en.');
-      p.drive = await MS.resolve(p.url);
+      const r = await MS.resolveAny(p.url);  // den første af dine konti, der har adgang til mappen
+      p.drive = { driveId: r.driveId, id: r.id, webUrl: r.webUrl };
+      p.msAccount = r.account;
       await this.saveState();
     }
     return p.drive;
@@ -2583,6 +2616,8 @@ class SettingsPage {
         ? 'Appen læser projektmappen i OneDrive direkte, og »📥 Læg i mappe« gemmer lige i den rigtige A104-mappe. '
           + 'Slå fra, hvis det giver problemer – så sendes filerne til pc’en igen. Forbundne mapper glemmes ikke, men bruges ikke, mens det er slået fra.'
         : 'Kræver Chrome på Android – denne browser kan ikke give appen adgang til en mappe.')));
+
+    if (MS.configured) wrap.append(msAccountsCard('#/settings', () => { this.root.replaceChildren(); this.build(); }));
 
     const offline = h('div', { class: 'muted' }, 'Tjekker…');
     const app = h('div', { class: 'card' }, h('h2', {}, 'App og offline'), offline);

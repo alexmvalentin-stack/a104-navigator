@@ -10,7 +10,8 @@ const MS = (() => {
   const AUTHORITY = `https://login.microsoftonline.com/${TENANT}/oauth2/v2.0`;
   const SCOPES = 'openid profile offline_access User.Read Files.ReadWrite.All';  // .All: også Teams-/SharePoint-mapper
   const GRAPH = 'https://graph.microsoft.com/v1.0';
-  const KEY = 'a104-ms';
+  const KEY = 'a104-ms';             // ældre versioner: én konto
+  const ACCOUNTS = 'a104-ms-konti';  // {current, list: {bruger: session}} – flere Microsoft-konti (skole, privat …)
   const FLOW_KEY = 'a104-ms-flow';
 
   const configured = !!CLIENT_ID && !CLIENT_ID.startsWith('__');
@@ -31,19 +32,50 @@ const MS = (() => {
     } catch { return {}; }
   }
 
-  let session = load(KEY);
+  let saved = load(ACCOUNTS) || { current: '', list: {} };
+  const legacy = load(KEY);
+  if (legacy && !Object.keys(saved.list).length) {  // flyt den ene konto fra en ældre version over
+    const k = (legacy.user || 'konto').toLowerCase();
+    saved = { current: k, list: { [k]: legacy } };
+    save(ACCOUNTS, saved);
+    save(KEY, null);
+  }
+  let session = saved.list[saved.current] || null;
+  const keyOf = (s) => (s.user || 'konto').toLowerCase();
+  // læs listen igen før hver ændring, så en konto tilføjet i et andet vindue ikke overskrives
+  const fresh = () => { const f = load(ACCOUNTS); if (f && f.list) saved = f; return saved; };
+  const persist = () => {
+    const current = saved.current;
+    fresh();
+    if (session) saved.list[keyOf(session)] = session;
+    saved.current = current;
+    save(ACCOUNTS, saved);
+  };
 
   function keep(tokens) {
     const c = tokens.id_token ? claims(tokens.id_token) : {};
+    const user = c.preferred_username || session?.user || '';
+    const prev = saved.list[(user || 'konto').toLowerCase()] || null;
     session = {
       access: tokens.access_token,
-      refresh: tokens.refresh_token || session?.refresh,
+      refresh: tokens.refresh_token || prev?.refresh,
       expires: Date.now() + (tokens.expires_in || 3600) * 1000,
-      name: c.name || session?.name || '',
-      user: c.preferred_username || session?.user || '',
-      tenant: c.tid || session?.tenant || '',
+      name: c.name || prev?.name || '',
+      user,
+      tenant: c.tid || prev?.tenant || '',
     };
-    save(KEY, session);
+    saved.current = keyOf(session);
+    persist();
+  }
+
+  /** Skift til en anden af de tilføjede konti. */
+  function use(key) {
+    fresh();
+    if (!saved.list[key]) return false;
+    session = saved.list[key];
+    saved.current = key;
+    save(ACCOUNTS, saved);
+    return true;
   }
 
   async function tokenRequest(params) {
@@ -54,8 +86,9 @@ const MS = (() => {
     return data;
   }
 
-  /** Send brugeren til Microsofts login. `returnHash` er siden, appen vender tilbage til. */
-  async function login(returnHash = location.hash) {
+  /** Send brugeren til Microsofts login. `returnHash` er siden, appen vender tilbage til. `add`: tilføj en konto mere
+   *  (Microsoft viser kontovalget i stedet for at logge den nuværende ind igen). */
+  async function login(returnHash = location.hash, { add = false } = {}) {
     const verifier = random(48);
     const challenge = b64url(await crypto.subtle.digest('SHA-256', new TextEncoder().encode(verifier)));
     const state = random(16);
@@ -64,7 +97,7 @@ const MS = (() => {
       client_id: CLIENT_ID, response_type: 'code', redirect_uri: redirectUri(), response_mode: 'query',
       scope: SCOPES, state, code_challenge: challenge, code_challenge_method: 'S256',
     });
-    if (session?.user) q.set('login_hint', session.user); else q.set('prompt', 'select_account');
+    if (session?.user && !add) q.set('login_hint', session.user); else q.set('prompt', 'select_account');
     location.assign(`${AUTHORITY}/authorize?${q}`);
   }
 
@@ -95,7 +128,7 @@ const MS = (() => {
     } catch (err) {
       if (err.code === 'invalid_grant' || err.code === 'interaction_required') {
         session = { ...session, access: null, refresh: null };
-        save(KEY, session);
+        persist();
         throw Object.assign(new Error('Login er udløbet – log ind igen'), { code: 'login_required' });
       }
       throw err;
@@ -167,15 +200,39 @@ const MS = (() => {
     return out;
   }
 
-  function logout() {
-    session = null;
-    save(KEY, null);
+  /** Log en konto ud (standard: den, der bruges nu). Er der flere, skiftes der til den næste. */
+  function logout(key = saved.current) {
+    fresh();
+    delete saved.list[key];
+    if (saved.current === key) saved.current = Object.keys(saved.list)[0] || '';
+    session = saved.list[saved.current] || null;
+    save(ACCOUNTS, saved);
+  }
+
+  /** Som resolve, men prøver alle tilføjede konti – den nuværende først. Returnerer også, hvilken konto der havde adgang. */
+  async function resolveAny(webUrl) {
+    const start = saved.current;
+    let last = null;
+    for (const k of [start, ...Object.keys(saved.list).filter((x) => x !== start)]) {
+      if (!use(k)) continue;
+      try { return { ...(await resolve(webUrl)), account: k }; } catch (err) {
+        last = err;
+        if (![401, 403, 404].includes(err.status) && err.code !== 'login_required') break;
+      }
+    }
+    if (start) use(start);
+    throw last || Object.assign(new Error('Ikke logget ind'), { code: 'login_required' });
   }
 
   return {
     configured,
     get signedIn() { return !!(session && (session.refresh || session.access)); },
-    get account() { return session ? { name: session.name, user: session.user } : null; },
-    login, handleRedirect, logout, get, all, resolve, upload,
+    get account() { return session ? { key: keyOf(session), name: session.name, user: session.user } : null; },
+    get accounts() {
+      return Object.entries(fresh().list).map(([key, s]) => ({ key, name: s.name, user: s.user, active: key === saved.current,
+        signedIn: !!(s.refresh || s.access) }));
+    },
+    has: (key) => !!fresh().list[key],
+    login, handleRedirect, logout, use, get, all, resolve, resolveAny, upload,
   };
 })();
