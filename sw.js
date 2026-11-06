@@ -1,9 +1,9 @@
 // Service worker: gør A104 Navigator offline. Appens filer og Python-runtime (Pyodide) gemmes ved installation.
-const BUILD = '2.21.1-184b389e8a';
+const BUILD = '2.22.0-5330d00cae';
 const PYODIDE_URL = 'https://cdn.jsdelivr.net/pyodide/v0.27.2/full/';
 const APP_CACHE = `a104-app-${BUILD}`;
 const PY_CACHE = `a104-pyodide-${PYODIDE_URL}`;
-const PRECACHE = ["./", "index.html", "app.css", "ms.js", "app.js", "worker.js", "manifest.webmanifest", "jsqr.js", "core.zip?v=2.21.1-184b389e8a", "data.zip?v=2.21.1-184b389e8a", "icons/icon-192.png", "icons/icon-512.png", "icons/maskable-512.png", "icons/apple-touch-icon.png", "icons/favicon-32.png", "data/love/AB18.pdf", "data/love/ABR18.pdf", "data/love/ABT18.pdf"];
+const PRECACHE = ["./", "index.html", "app.css", "ms.js", "app.js", "worker.js", "manifest.webmanifest", "jsqr.js", "core.zip?v=2.22.0-5330d00cae", "data.zip?v=2.22.0-5330d00cae", "icons/icon-192.png", "icons/icon-512.png", "icons/maskable-512.png", "icons/apple-touch-icon.png", "icons/favicon-32.png", "data/love/AB18.pdf", "data/love/ABR18.pdf", "data/love/ABT18.pdf"];
 const PYODIDE_CORE = ['pyodide.js', 'pyodide.asm.js', 'pyodide.asm.wasm', 'python_stdlib.zip', 'pyodide-lock.json'];
 const PYODIDE_PACKAGES = ['sqlite3'];
 

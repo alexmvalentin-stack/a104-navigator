@@ -2,8 +2,8 @@
 // A104 Navigator – web-app (PWA). Brugerfladen er skrevet her; al logik (søgning, dokumentfinder, BR18, AB 18 …)
 // er A104 Navigators egen Python-kerne, der kører i worker.js med Pyodide.
 
-const BUILD = '2.21.1-184b389e8a';
-const VERSION = '2.21.1';
+const BUILD = '2.22.0-5330d00cae';
+const VERSION = '2.22.0';
 
 // =========================================================================== hjælpere
 const $ = (sel, el = document) => el.querySelector(sel);
@@ -132,7 +132,7 @@ function api(fn, ...args) {
 }
 
 // =========================================================================== tilstand
-const prefs = { theme: 'system', projectId: '', includePid: false, openFiles: 'browser' };
+const prefs = { theme: 'system', projectId: '', includePid: false, openFiles: 'browser', folderAccess: true };
 let meta = {};
 let installPrompt = null;
 const cache = {};
@@ -1551,6 +1551,68 @@ function mergeLive(old, live) {
 /** Ændrer listen noget på det, der vises? */
 const scanKey = (items) => items.map((i) => `${i.path}|${i.modified}|${i.size}|${i.approval || ''}|${i.by || ''}`).sort().join('\n');
 
+// =========================================================================== projektmappe på telefonen (beta)
+// Chrome på Android (fra version 132) kan give appen adgang til en mappe, du selv vælger – også en OneDrive-/Teams-mappe
+// gennem OneDrive-appen. Så læser appen projektet direkte og gemmer »📥 Læg i mappe« lige i den rigtige A104-mappe:
+// uden Microsoft-login, uden pc'en og uden ntfy.sh. iPhone (også Chrome dér) har ikke funktionen.
+// Alt ligger her og bruges kun, når en mappe er forbundet; det slås fra under Indstillinger (prefs.folderAccess).
+const FOLDER = {
+  available: () => 'showDirectoryPicker' in window,
+  supported: () => FOLDER.available() && prefs.folderAccess !== false,
+  key: (id) => `dir-handle:${id}`,
+  pick: () => window.showDirectoryPicker({ mode: 'readwrite', id: 'a104-projekt' }),
+  get: (id) => store.get(FOLDER.key(id), null),
+  set: (id, handle) => store.set(FOLDER.key(id), handle),
+  /** Må appen gemme i mappen? `ask` spørger brugeren (kræver et tryk lige før). */
+  async allowed(handle, ask = false) {
+    const opts = { mode: 'readwrite' };
+    try {
+      if ((await handle.queryPermission(opts)) === 'granted') return true;
+      return ask && (await handle.requestPermission(opts)) === 'granted';
+    } catch { return false; }
+  },
+  /** Alle mapper og filer i projektmappen – samme form som pc'ens liste (sti relativ til projektmappen med »/«). */
+  async scan(handle, onProgress) {
+    const items = [];
+    let folders = 0;
+    const walk = async (dir, prefix) => {
+      for await (const [name, entry] of dir.entries()) {
+        if (items.length >= SCAN_LIMIT) return;
+        if (/^(\.|~\$)/.test(name) || /^(desktop\.ini|thumbs\.db)$/i.test(name)) continue;
+        const path = prefix ? `${prefix}/${name}` : name;
+        if (entry.kind === 'directory') {
+          items.push({ id: path, name, path, folder: true, size: 0, modified: '', url: '' });
+          if (onProgress) onProgress(++folders, items.length);
+          await walk(entry, path);
+        } else {
+          let f = null;
+          try { f = await entry.getFile(); } catch { /* fx en fil, OneDrive ikke kan give lige nu */ }
+          items.push({ id: path, name, path, folder: false, size: f?.size || 0, modified: f ? new Date(f.lastModified).toISOString() : '', url: '' });
+        }
+      }
+    };
+    await walk(handle, '');
+    return { items, truncated: items.length >= SCAN_LIMIT };
+  },
+  /** Gem filen i undermappen `folderPath` (oprettes, hvis den mangler). Findes navnet, bliver det »navn (2)« – intet overskrives. */
+  async save(handle, folderPath, file) {
+    let dir = handle;
+    for (const part of folderPath.split('/').filter(Boolean)) dir = await dir.getDirectoryHandle(part, { create: true });
+    const dot = file.name.lastIndexOf('.');
+    const stem = dot > 0 ? file.name.slice(0, dot) : file.name;
+    const ext = dot > 0 ? file.name.slice(dot) : '';
+    let name = file.name;
+    for (let n = 2; ; n++) {
+      try { await dir.getFileHandle(name); } catch (err) { if (err.name === 'NotFoundError' || err.name === 'TypeError') break; throw err; }
+      name = `${stem} (${n})${ext}`;
+    }
+    const out = await (await dir.getFileHandle(name, { create: true })).createWritable();
+    await out.write(file);
+    await out.close();
+    return { name, size: file.size, lastModifiedDateTime: new Date().toISOString() };
+  },
+};
+
 const LIVE_EVERY = 5 * 60000;   // mens projektet står åbent
 const LIVE_RETURN = 60000;      // når man vender tilbage til appen – ikke oftere end dette
 
@@ -1591,6 +1653,13 @@ class ProjectPage {
             h('li', {}, 'Tryk herunder, og hold telefonen mod QR-koden på pc’en, til der står ', h('i', {}, 'Gemt'), '.')),
           h('button', { type: 'button', class: 'btn primary', onclick: () => this.scanQr() }, '📷 Scan fra pc'),
           h('p', { class: 'muted' }, 'Kun mappe- og filnavne overføres – intet filindhold, intet login, intet internet.')),
+        FOLDER.supported() ? h('div', { class: 'card' }, h('h2', {}, 'Åbn projektmappen på telefonen ', h('span', { class: 'beta' }, 'BETA')),
+          h('ol', { class: 'steps' },
+            h('li', {}, 'Tryk herunder, vælg ', h('b', {}, 'OneDrive'), ' i menuen, og gå til projektmappen (fx under Delte biblioteker / Teams).'),
+            h('li', {}, 'Tryk ', h('b', {}, 'Brug denne mappe'), ', og giv appen lov.')),
+          h('button', { type: 'button', class: 'btn', onclick: () => this.openFolder() }, '📂 Vælg projektmappe'),
+          h('p', { class: 'muted' }, 'Kræver Chrome på Android. Appen læser projektet direkte, og »📥 Læg i mappe« gemmer lige i den rigtige '
+            + 'A104-mappe – uden login og uden pc’en. Har du scannet projektet fra pc’en, bliver mappen koblet på det.')) : null,
         h('div', { class: 'card' }, h('h2', {}, 'Åbn projekt fra OneDrive'),
           h('ol', { class: 'steps' },
             h('li', {}, 'Åbn projektet i A104 Navigator på pc’en (Windows-programmet). Det gemmer projektet i din OneDrive i mappen ', h('b', {}, 'A104 Navigator'), '.'),
@@ -1793,7 +1862,70 @@ class ProjectPage {
     await this.saveState();
     this.project = p;
     this.scan = null;
-    this.openProject(refresh && p.source !== 'file');
+    return this.openProject(refresh && p.source !== 'file' && p.source !== 'dir');
+  }
+
+  // ------------------------------------------------ projektmappe på telefonen (beta, se FOLDER)
+  /** Fra startsiden: vælg projektmappen. Findes projektet allerede (fx scannet fra pc'en), kobles mappen på det. */
+  async openFolder() {
+    let handle;
+    try { handle = await FOLDER.pick(); } catch (err) { if (err.name !== 'AbortError') toast(`Kunne ikke åbne mappen: ${err.message}`); return; }
+    const same = this.state.list.find((x) => x.name.toLowerCase() === handle.name.toLowerCase());
+    const p = same || { id: `dir:${handle.name}`, source: 'dir', name: handle.name, where: 'Projektmappe på telefonen', url: '', projectId: '' };
+    await FOLDER.set(p.id, handle);
+    await this.choose(p, false);
+    if (same) this.readFolder(false);
+  }
+
+  /** I et åbent projekt: giv appen adgang til projektmappen. */
+  async connectFolder() {
+    let handle;
+    try { handle = await FOLDER.pick(); } catch (err) { if (err.name !== 'AbortError') toast(`Kunne ikke åbne mappen: ${err.message}`); return; }
+    if (handle.name.toLowerCase() !== this.project.name.toLowerCase()
+      && !confirm(`Mappen hedder »${handle.name}«, men projektet hedder »${this.project.name}«. Brug mappen alligevel?`)) return;
+    await FOLDER.set(this.project.id, handle);
+    toast('Mappen er forbundet');
+    await this.openProject(false);
+    this.readFolder(false);
+  }
+
+  async forgetFolder() {
+    await FOLDER.set(this.project.id, null);
+    toast('Appen har glemt mappen – filerne i den er ikke rørt');
+    this.openProject(false);
+  }
+
+  /** Læs projektet fra mappen. Uændrede filer beholder initialer og godkendelse fra pc'en (mergeLive). */
+  async readFolder(visible) {
+    const p = this.project;
+    if (!FOLDER.supported()) { toast('»Projektmappe på telefonen« er slået fra under ⚙ Indstillinger.'); return; }
+    const handle = this.dirHandle || await FOLDER.get(p.id);
+    if (!handle) { this.connectFolder(); return; }
+    if (!(await FOLDER.allowed(handle, true))) { toast('Appen fik ikke lov til at læse mappen – tryk igen og vælg Tillad.'); return; }
+    if (this.loading) return;
+    this.loading = true;
+    const btn = p.source === 'dir' ? this.refreshBtn : this.folderBtn;
+    const old = btn?.textContent;
+    if (btn) btn.disabled = true;
+    try {
+      const res = await FOLDER.scan(handle, (folders, n) => {
+        if (btn) btn.textContent = `Læser… ${folders} mapper`;
+        if (visible && !this.scan) this.scroll.replaceChildren(h('p', { class: 'empty' }, `Læser projektmappen… ${folders} mapper, ${n} elementer`));
+      });
+      const key = `project-scan:${p.id}`;
+      const cached = await store.get(key, null);
+      const items = cached && p.source !== 'dir' ? mergeLive(cached.items, res.items) : res.items;
+      const scan = { at: new Date().toISOString(), truncated: res.truncated, items };
+      await store.set(key, scan);
+      if (this.project !== p || !this.split?.isConnected) return;
+      await this.apply(scan);
+      toast(`Læst fra mappen: ${res.items.filter((i) => !i.folder).length} filer`);
+    } catch (err) {
+      toast(`Kunne ikke læse mappen: ${err.message}`);
+    } finally {
+      this.loading = false;
+      if (btn) { btn.disabled = false; btn.textContent = old; }
+    }
   }
 
   async logout() {
@@ -1813,9 +1945,17 @@ class ProjectPage {
     this.onlyIssues.addEventListener('change', () => this.showFolder(this.folder));
     this.onlyPending = h('input', { type: 'checkbox' });
     this.onlyPending.addEventListener('change', () => this.showFolder(this.folder));
-    this.refreshBtn = p.source === 'file'
-      ? h('button', { type: 'button', class: 'btn', onclick: () => this.scanQr(), title: 'Scan QR-koden fra »📱 Mobil (beta)« på pc’en igen' }, '📷 Opdatér (scan)')
-      : h('button', { type: 'button', class: 'btn', onclick: () => this.load(true) }, '⟳ Opdater');
+    this.dirHandle = FOLDER.supported() ? await FOLDER.get(p.id) : null;
+    this.refreshBtn = p.source === 'dir'
+      ? h('button', { type: 'button', class: 'btn', onclick: () => this.readFolder(true) }, '⟳ Læs mappen igen')
+      : p.source === 'file'
+        ? h('button', { type: 'button', class: 'btn', onclick: () => this.scanQr(), title: 'Scan QR-koden fra »📱 Mobil (beta)« på pc’en igen' }, '📷 Opdatér (scan)')
+        : h('button', { type: 'button', class: 'btn', onclick: () => this.load(true) }, '⟳ Opdater');
+    // en projektmappe på telefonen (beta): læs fra den / forbind en
+    this.folderBtn = !FOLDER.supported() || p.source === 'dir' ? null : this.dirHandle
+      ? h('button', { type: 'button', class: 'btn', onclick: () => this.readFolder(true), title: 'Læs projektet fra mappen på telefonen' }, '📂 Læs fra mappen')
+      : h('button', { type: 'button', class: 'btn', onclick: () => this.connectFolder(), title: 'Giv appen adgang til projektmappen i OneDrive – kræver Chrome på Android' },
+        '📂 Forbind mappe (beta)');
     this.liveBtn = p.source === 'file' && MS.configured && p.url // ikke logget ind endnu: knappen fører til login
       ? h('button', { type: 'button', class: 'btn', onclick: () => (MS.signedIn ? this.load(false) : MS.login('#/project')),
         title: 'Hent den nyeste filliste fra OneDrive/Teams' }, MS.signedIn ? '⟳ Opdater' : '⟳ Log ind og opdatér') : null;
@@ -1834,11 +1974,15 @@ class ProjectPage {
         h('button', { type: 'button', class: 'btn primary', onclick: () => this.pickUpload(true),
           title: 'Tag et foto eller vælg en fil – pc’en finder selv den rigtige mappe' }, '📥 Læg i mappe'),
         h('button', { type: 'button', class: 'btn', onclick: () => this.pickCheck(), title: 'Vælg filer fra OneDrive på telefonen og tjek navngivningen' }, '🔍 Tjek filer'),
-        this.liveBtn, this.refreshBtn, h('button', { type: 'button', class: 'btn', onclick: () => this.showStart() }, 'Skift projekt')),
+        this.liveBtn, this.refreshBtn, this.folderBtn, h('button', { type: 'button', class: 'btn', onclick: () => this.showStart() }, 'Skift projekt')),
       this.split);
     this.scroll.append(h('p', { class: 'empty' }, 'Henter projektet…'));
     const cached = refresh ? null : await store.get(`project-scan:${p.id}`, null);
-    if (cached) { await this.apply(cached); this.autoRefresh(0); } else if (p.source === 'file') this.showStart('Projektfilen er ikke gemt på denne enhed – vælg den igen.'); else this.load(true);
+    if (this.dirHandle) {
+      this.detail.tool('Fjern mappe', () => this.forgetFolder(), 'Appen glemmer projektmappen på telefonen (filerne røres ikke)');
+    }
+    if (cached) { await this.apply(cached); this.autoRefresh(0); } else if (p.source === 'dir') this.readFolder(true);
+    else if (p.source === 'file') this.showStart('Projektfilen er ikke gemt på denne enhed – vælg den igen.'); else this.load(true);
   }
 
   /** Automatisk i baggrunden: stille – fejl og manglende net viser bare den sidst gemte liste. */
@@ -2039,7 +2183,7 @@ class ProjectPage {
     input.addEventListener('change', () => {
       const file = input.files[0];
       if (file) {
-        if (quick && this.canSaveDirect()) this.saveQuick(file);
+        if (quick && ((this.dirHandle && FOLDER.supported()) || this.canSaveDirect())) this.saveQuick(file);
         else if (quick && this.project.relay) this.sendQuick(file);
         else if (quick && this.project.inbox) this.showQuickUpload(file);
         else this.showUpload(file);
@@ -2075,14 +2219,21 @@ class ProjectPage {
   /** Gem filen i projektets mappe. Uden `pick` findes mappe og A104-navn her på telefonen med Windows-programmets regler
    *  (project_file); mangler mappen i projektet, oprettes den efter A104-strukturen. Returnerer {code, folder, name, folderPath, webUrl}. */
   async saveDirect(file, pick, progress) {
-    const root = await this.driveRoot();
+    // projektmappen på telefonen (beta) først – ellers Microsoft Graph
+    const viaFolder = this.dirHandle && FOLDER.supported();
+    if (viaFolder && !(await FOLDER.allowed(this.dirHandle)) && !this.canSaveDirect()) {
+      throw Object.assign(new Error('Appen skal have lov til at gemme i projektmappen igen.'), { code: 'folder_permission' });
+    }
+    const useFolder = viaFolder && await FOLDER.allowed(this.dirHandle);
+    const root = useFolder ? null : await this.driveRoot();
     if (!pick) {
       const s = await api('project_file', phoneName(file), null, this.project.projectId || prefs.projectId || '');
       if (!s.code) throw new Error(s.reason || s.error || 'Kunne ikke finde en A104-mappe til filen.');
       const own = this.folderFor(s.code);
       pick = { code: s.code, folder: s.folder, name: s.name, folderPath: own ? own.path : (s.path || s.code).split(' → ').join('/') };
     }
-    const item = await MS.upload(root.driveId, root.id, `${pick.folderPath}/${pick.name}`, file, progress);
+    const item = useFolder ? await FOLDER.save(this.dirHandle, pick.folderPath, new File([file], pick.name, { type: file.type }))
+      : await MS.upload(root.driveId, root.id, `${pick.folderPath}/${pick.name}`, file, progress);
     await this.addUploaded(pick.folderPath, item || { name: pick.name });
     return { ...pick, name: item?.name || pick.name, webUrl: item?.webUrl || '' };
   }
@@ -2128,16 +2279,17 @@ class ProjectPage {
       show(h('p', { class: 'break' }, h('b', {}, r.name)), h('p', { class: 'muted break' }, `${this.project.name} › ${r.folderPath.split('/').join(' › ')}`),
         h('p', { class: 'muted' }, 'Står som ⏳ Mangler godkendelse, til en på holdet godkender den.'));
     } catch (err) {
-      if (this.project.relay && err.code !== 'login_required') {
+      if (this.project.relay && err.code !== 'login_required' && err.code !== 'folder_permission') {
         toast(`Kunne ikke gemme direkte: ${err.message} – sender til pc’en i stedet`);
         this.sendQuick(file);
         return;
       }
       status.className = 'warn-text';
       status.textContent = `⚠ ${err.message === 'Failed to fetch' ? 'Ingen forbindelse – tjek internettet.' : err.message}`;
+      const retry = async () => { if (this.dirHandle) await FOLDER.allowed(this.dirHandle, true); this.saveQuick(file); };
       actions.replaceChildren(err.code === 'login_required'
         ? h('button', { type: 'button', class: 'btn primary', onclick: () => MS.login('#/project') }, 'Log ind med Microsoft')
-        : h('button', { type: 'button', class: 'btn primary', onclick: () => this.saveQuick(file) }, 'Prøv igen'),
+        : h('button', { type: 'button', class: 'btn primary', onclick: retry }, err.code === 'folder_permission' ? 'Giv adgang og gem' : 'Prøv igen'),
       h('button', { type: 'button', class: 'btn', onclick: () => this.showUpload(file) }, 'Vælg selv mappe og navn…'));
     }
   }
@@ -2414,6 +2566,20 @@ class SettingsPage {
       h('div', { class: 'muted', style: 'margin-top:8px' }, 'I browseren: luk den, så er du tilbage i A104. '
         + 'Første gang skal du måske logge ind med din skolekonto. I appen: filen åbner i Teams/OneDrive, '
         + 'og du skal selv skifte tilbage til A104.')));
+
+    const folderSeg = h('div', { class: 'seg', role: 'group', 'aria-label': 'Projektmappe på telefonen' });
+    for (const [key, label] of [[true, 'Til'], [false, 'Fra']]) {
+      folderSeg.append(h('button', { type: 'button', 'aria-pressed': String((prefs.folderAccess !== false) === key), onclick: async (e) => {
+        prefs.folderAccess = key;
+        folderSeg.querySelectorAll('button').forEach((b) => b.setAttribute('aria-pressed', String(b === e.currentTarget)));
+        await savePrefs();
+      } }, label));
+    }
+    wrap.append(h('div', { class: 'card' }, h('h2', {}, 'Projektmappe på telefonen ', h('span', { class: 'beta' }, 'BETA')), folderSeg,
+      h('div', { class: 'muted', style: 'margin-top:8px' }, FOLDER.available()
+        ? 'Appen læser projektmappen i OneDrive direkte, og »📥 Læg i mappe« gemmer lige i den rigtige A104-mappe. '
+          + 'Slå fra, hvis det giver problemer – så sendes filerne til pc’en igen. Forbundne mapper glemmes ikke, men bruges ikke, mens det er slået fra.'
+        : 'Kræver Chrome på Android – denne browser kan ikke give appen adgang til en mappe.')));
 
     const offline = h('div', { class: 'muted' }, 'Tjekker…');
     const app = h('div', { class: 'card' }, h('h2', {}, 'App og offline'), offline);
