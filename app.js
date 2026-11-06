@@ -2,7 +2,7 @@
 // A104 Navigator – web-app (PWA). Brugerfladen er skrevet her; al logik (søgning, dokumentfinder, BR18, AB 18 …)
 // er A104 Navigators egen Python-kerne, der kører i worker.js med Pyodide.
 
-const BUILD = '2.22.0-5330d00cae';
+const BUILD = '2.22.0-77b64eb7ee';
 const VERSION = '2.22.0';
 
 // =========================================================================== hjælpere
@@ -1497,7 +1497,8 @@ async function shrinkPhoto(file) {
   } catch { return file; }
 }
 
-async function sendToPc(file, project, progress) {
+const sendToPc = (...args) => whileBusy(() => sendToPcNow(...args));  // appen opdaterer sig ikke midt i en sending
+async function sendToPcNow(file, project, progress) {
   file = await shrinkPhoto(file);
   if (file.size > RELAY_MAX) throw new Error('Filen er over 25 MB – brug »Del med OneDrive« i stedet.');
   const n = Math.max(1, Math.ceil(file.size / RELAY_PART));
@@ -2218,7 +2219,9 @@ class ProjectPage {
 
   /** Gem filen i projektets mappe. Uden `pick` findes mappe og A104-navn her på telefonen med Windows-programmets regler
    *  (project_file); mangler mappen i projektet, oprettes den efter A104-strukturen. Returnerer {code, folder, name, folderPath, webUrl}. */
-  async saveDirect(file, pick, progress) {
+  saveDirect(...args) { return whileBusy(() => this.saveDirectNow(...args)); }  // ikke opdatere midt i en gemning
+
+  async saveDirectNow(file, pick, progress) {
     // projektmappen på telefonen (beta) først – ellers Microsoft Graph
     const viaFolder = this.dirHandle && FOLDER.supported();
     if (viaFolder && !(await FOLDER.allowed(this.dirHandle)) && !this.canSaveDirect()) {
@@ -2671,18 +2674,37 @@ function wireTopbar() {
   });
 }
 
+// Opdatering af sig selv: appen tjekker for en ny version ved start, hver gang man vender tilbage til den, og hver halve
+// time. En ny version tages i brug med det samme, hvis appen lige er åbnet – ellers, når man forlader appen (så skærmen
+// ikke skifter under én). Aldrig midt i at sende eller gemme en fil (appBusy).
+const APP_START = Date.now();
+let appBusy = 0;
+async function whileBusy(work) {
+  appBusy++;
+  try { return await work(); } finally { appBusy--; }
+}
+
 function registerServiceWorker() {
   if (!('serviceWorker' in navigator) || location.protocol === 'file:') return;
   navigator.serviceWorker.register('sw.js').then((reg) => {
+    let pending = null;
+    const apply = () => { if (pending) pending.postMessage('skipWaiting'); };
     const offer = (sw) => {
       if (!navigator.serviceWorker.controller) return; // første installation – intet at opdatere
-      toast('Der er en ny version af A104 Navigator.', { label: 'Genindlæs', run: () => sw.postMessage('skipWaiting') });
+      pending = sw;
+      if (!appBusy && (Date.now() - APP_START < 15000 || document.hidden)) { apply(); return; }
+      toast('Der er en ny version – den tages i brug, når du forlader appen.', { label: 'Opdatér nu', run: apply });
     };
     if (reg.waiting) offer(reg.waiting);
     reg.addEventListener('updatefound', () => {
       const sw = reg.installing;
       sw?.addEventListener('statechange', () => { if (sw.state === 'installed') offer(sw); });
     });
+    const check = () => { if (navigator.onLine) reg.update().catch(() => { /* prøver igen senere */ }); };
+    document.addEventListener('visibilitychange', () => {
+      if (document.hidden) { if (pending && !appBusy) apply(); } else check();
+    });
+    setInterval(check, 30 * 60000);
   }).catch(() => { /* offline-brug er ikke muligt – appen virker stadig online */ });
   let reloading = false;
   navigator.serviceWorker.addEventListener('controllerchange', () => {
